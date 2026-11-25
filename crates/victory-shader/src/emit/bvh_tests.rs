@@ -6,6 +6,7 @@
 //! the program shifts into the descriptor, or from a pointer in root
 //! constants; both are title memory (`Lower::memory`) in such a program.
 
+use super::bitcode::{Bin, Cast, pred};
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
@@ -469,7 +470,7 @@ const LITERAL: u8 = 255;
 /// direction, inverse direction, pointer high), intersects it with a
 /// descriptor based at that SRV, and stores the four dwords to the raw UAV
 /// at table entry 0 (s2), at byte 16n.
-fn program(wide: bool) -> Vec<u32> {
+fn program(wide: bool, guarded: bool) -> Vec<u32> {
     let global_load_x4 =
         |vdst: u32, offset: u32| [0x37 << 26 | 0x0E << 18 | 2 << 14 | offset, 1 | vdst << 24];
     let mut w = vec![
@@ -492,6 +493,10 @@ fn program(wide: bool) -> Vec<u32> {
         s_mov(15, LITERAL),
         8 << 28 | 1 << 24 | 1 << 27 | 0x3FF,
     ]);
+    if guarded {
+        // Mask exec to a single lane so `bvh` lowers under a lane guard.
+        w.push(0x7DA4_0080); // v_cmpx_eq_u32 exec, 0, v0
+    }
     // Result v[20:23], descriptor s[12:15].
     let rest = 20 << 8 | (12 >> 2) << 16;
     if wide {
@@ -517,6 +522,10 @@ fn program(wide: bool) -> Vec<u32> {
 }
 
 fn build(wide: bool, memory: bool) -> HostShader {
+    build_with(wide, memory, false)
+}
+
+fn build_with(wide: bool, memory: bool, guarded: bool) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -569,7 +578,10 @@ fn build(wide: bool, memory: bool) -> HostShader {
             rsrc2: 3 << 1,
             threads: [256, 1, 1],
         }),
-        code: program(wide).iter().flat_map(|w| w.to_le_bytes()).collect(),
+        code: program(wide, guarded)
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect(),
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
@@ -632,8 +644,12 @@ fn to_half(x: f32) -> u32 {
     (bits >> 16 & 0x8000) | (e as u32) << 10 | (bits >> 13 & 0x3FF)
 }
 
-/// One random case: the node's dwords (32), its pointer type, the ray.
+/// One random case: the node's dwords (28), its pointer type, the ray.
 fn case(rng: &mut Rng) -> (Vec<u32>, u32, Ray) {
+    case_for_type(rng, None)
+}
+
+fn case_for_type(rng: &mut Rng, forced_ty: Option<u32>) -> (Vec<u32>, u32, Ray) {
     // The dominant direction component a power of two (exact shear), the
     // others smaller; now and then 0 (inverse +-inf).
     let kz = rng.below(3) as usize;
@@ -652,11 +668,14 @@ fn case(rng: &mut Rng) -> (Vec<u32>, u32, Ray) {
         std::array::from_fn(|k| ((origin[k] + t * dir[k]) * 16.0).round() / 16.0 + rng.grid(1.0))
     };
     let mut w: Vec<u32> = (0..28).map(|_| rng.next()).collect();
-    let ty = match rng.below(20) {
-        0 => 6 + rng.below(2),
-        1..=7 => 5,
-        8..=11 => 4,
-        _ => rng.below(4),
+    let ty = match forced_ty {
+        Some(ty) => ty,
+        None => match rng.below(20) {
+            0 => 6 + rng.below(2),
+            1..=7 => 5,
+            8..=11 => 4,
+            _ => rng.below(4),
+        },
     };
     match ty {
         4 | 5 => {
@@ -712,14 +731,18 @@ fn case(rng: &mut Rng) -> (Vec<u32>, u32, Ray) {
 }
 
 fn run_cases(wide: bool, batches: usize, memory: bool) {
-    let shader = build(wide, memory);
-    // A program with the BVH instruction reads its root SRV as title
-    // memory too.
-    assert!(shader.memory);
     let mut rng = Rng(if wide { 77 } else { 7 });
     let batches: Vec<Vec<(Vec<u32>, u32, Ray)>> = (0..batches)
         .map(|_| (0..LANES).map(|_| case(&mut rng)).collect())
         .collect();
+    run_batches(wide, memory, &batches);
+}
+
+fn run_batches(wide: bool, memory: bool, batches: &[Vec<(Vec<u32>, u32, Ray)>]) {
+    let shader = build(wide, memory);
+    // A program with the BVH instruction reads its root SRV as title
+    // memory too.
+    assert!(shader.memory);
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -742,7 +765,7 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
             };
         }
         let (mut hits, mut tris) = (0, 0);
-        for cases in &batches {
+        for cases in batches {
             // Rays, then the nodes, 128 bytes each.
             let nodes = (LANES * 64) as u32;
             let mut data = vec![0u32; LANES * 16 + LANES * 32];
@@ -834,4 +857,763 @@ fn page_table(view: u32, null: u32) -> Vec<u32> {
 fn intersections_on_nodes_in_title_memory_equal_the_reference() {
     run_cases(false, 4, true);
     run_cases(true, 4, true);
+}
+
+/// Coherent single-type waves (box16, box32, triangle 0, triangles 0..=3,
+/// instance, procedural) alongside mixed box16/box32 and fully mixed waves,
+/// exercising both uniform fast paths and divergent merges across every
+/// node-type branch.
+#[test]
+fn coherent_and_mixed_node_types_on_the_gpu_equal_the_reference() {
+    let mut rng = Rng(0xB74_D15D);
+    let make_batch = |rng: &mut Rng| -> Vec<(Vec<u32>, u32, Ray)> {
+        (0..LANES)
+            .map(|lane| {
+                let ty = match lane / 32 {
+                    0 => 4,                     // coherent box16
+                    1 => 5,                     // coherent box32
+                    2 => 0,                     // coherent triangle type 0
+                    3 => (lane & 3) as u32,     // coherent triangles (all 4 subtypes)
+                    4 => 6,                     // coherent instance
+                    5 => 7,                     // coherent procedural
+                    6 => 4 + (lane & 1) as u32, // mixed box16 + box32
+                    _ => (lane & 7) as u32,     // fully mixed across all 8 types
+                };
+                case_for_type(rng, Some(ty))
+            })
+            .collect()
+    };
+    let batches: Vec<_> = (0..4).map(|_| make_batch(&mut rng)).collect();
+    run_batches(false, false, &batches);
+    run_batches(true, true, &batches);
+}
+
+// ---- zero-GPU DXIL bitcode CFG + validator tests ----
+
+struct BitReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn read(&mut self, width: u32) -> u64 {
+        let mut out = 0u64;
+        for bit in 0..width as usize {
+            let b = (self.bytes[self.pos >> 3] >> (self.pos & 7)) & 1;
+            out |= u64::from(b) << bit;
+            self.pos += 1;
+        }
+        out
+    }
+
+    fn vbr(&mut self, width: u32) -> u64 {
+        let hi = 1u64 << (width - 1);
+        let mut out = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let chunk = self.read(width);
+            out |= (chunk & (hi - 1)) << shift;
+            if chunk & hi == 0 {
+                return out;
+            }
+            shift += width - 1;
+        }
+    }
+
+    fn align32(&mut self) {
+        self.pos = (self.pos + 31) & !31;
+    }
+
+    fn skip_words(&mut self, words: u64) {
+        self.pos += words as usize * 32;
+    }
+}
+
+fn decode_signed(v: u64) -> i64 {
+    if v & 1 != 0 {
+        -((v >> 1) as i64)
+    } else {
+        (v >> 1) as i64
+    }
+}
+
+#[derive(Debug, Clone)]
+enum BcType {
+    Void,
+    Float,
+    Struct(Vec<usize>),
+    Array(usize),
+    Func { ret: usize },
+    Other,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BcValTy {
+    Ty(usize),
+    Other,
+}
+
+#[derive(Debug)]
+enum BcInst {
+    Bin {
+        op: u64,
+        is_float: bool,
+        lhs: usize,
+        rhs: usize,
+    },
+    Cast {
+        op: u64,
+        dst_is_float: bool,
+    },
+    Cmp {
+        pred: u8,
+        lhs: usize,
+        rhs: usize,
+    },
+    Phi {
+        is_float: bool,
+        incoming: Vec<(usize, usize)>,
+    },
+    Call {
+        callee: String,
+    },
+    Other,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BcTerm {
+    Ret,
+    Br(usize),
+    CondBr { cond: usize, t: usize, f: usize },
+}
+
+#[derive(Debug, Default)]
+struct BcBlock {
+    insts: Vec<BcInst>,
+    term: Option<BcTerm>,
+}
+
+struct DecodedModule {
+    blocks: Vec<BcBlock>,
+    int_consts: std::collections::HashMap<usize, i64>,
+    inst_by_id: std::collections::HashMap<usize, (usize, usize)>,
+}
+
+impl DecodedModule {
+    fn inst(&self, id: usize) -> &BcInst {
+        let &(b, i) = self.inst_by_id.get(&id).expect("instruction value id");
+        &self.blocks[b].insts[i]
+    }
+
+    fn succs(&self, b: usize) -> Vec<usize> {
+        match self.blocks[b].term.expect("terminated block") {
+            BcTerm::Ret => Vec::new(),
+            BcTerm::Br(t) => vec![t],
+            BcTerm::CondBr { t, f, .. } => vec![t, f],
+        }
+    }
+
+    fn preds(&self, target: usize) -> Vec<usize> {
+        (0..self.blocks.len())
+            .filter(|&b| self.succs(b).contains(&target))
+            .collect()
+    }
+
+    fn can_reach(&self, start: usize, goal: usize) -> bool {
+        let mut seen = vec![false; self.blocks.len()];
+        let mut stack = vec![start];
+        seen[start] = true;
+        while let Some(b) = stack.pop() {
+            if b == goal {
+                return true;
+            }
+            for s in self.succs(b) {
+                if !seen[s] {
+                    seen[s] = true;
+                    stack.push(s);
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Decodes our emitter's unabbreviated LLVM 3.7 bitcode from a DXIL container.
+fn decode_dxil_module(container_bytes: &[u8]) -> DecodedModule {
+    let container = crate::dxbc::Container::parse(container_bytes).expect("valid DXBC");
+    let part = container
+        .part(crate::dxbc::FourCC::DXIL)
+        .expect("DXIL part");
+    assert_eq!(&part.data[8..12], b"DXIL");
+    let bc_off = 8 + u32::from_le_bytes(part.data[16..20].try_into().unwrap()) as usize;
+    let bc_len = u32::from_le_bytes(part.data[20..24].try_into().unwrap()) as usize;
+    let bitcode = &part.data[bc_off..bc_off + bc_len];
+    assert_eq!(&bitcode[..4], b"BC\xC0\xDE");
+
+    let mut r = BitReader {
+        bytes: bitcode,
+        pos: 32,
+    };
+    assert_eq!(r.read(2), 1, "expected MODULE_BLOCK");
+    assert_eq!(r.vbr(8), 8, "expected MODULE_BLOCK id");
+    let mod_width = r.vbr(4) as u32;
+    r.align32();
+    let _mod_words = r.read(32);
+
+    let mut types = Vec::new();
+    let mut val_ty = Vec::new();
+    let mut int_consts = std::collections::HashMap::new();
+    let mut names = std::collections::HashMap::new();
+    let mut blocks = Vec::new();
+    let mut inst_by_id = std::collections::HashMap::new();
+
+    let field_ty = |types: &[BcType], agg: BcValTy, idx: usize| -> BcValTy {
+        match agg {
+            BcValTy::Ty(t) => match &types[t] {
+                BcType::Struct(fields) => BcValTy::Ty(fields[idx]),
+                BcType::Array(elem) => BcValTy::Ty(*elem),
+                _ => BcValTy::Other,
+            },
+            BcValTy::Other => BcValTy::Other,
+        }
+    };
+
+    loop {
+        match r.read(mod_width) {
+            0 => {
+                r.align32();
+                break;
+            }
+            1 => {
+                let id = r.vbr(8);
+                let width = r.vbr(4) as u32;
+                r.align32();
+                let words = r.read(32);
+                match id {
+                    17 => loop {
+                        match r.read(width) {
+                            0 => {
+                                r.align32();
+                                break;
+                            }
+                            3 => {
+                                let code = r.vbr(6);
+                                let n = r.vbr(6);
+                                let ops: Vec<u64> = (0..n).map(|_| r.vbr(6)).collect();
+                                match code {
+                                    1 | 19 => {}
+                                    2 => types.push(BcType::Void),
+                                    3 => types.push(BcType::Float),
+                                    11 => types.push(BcType::Array(ops[1] as usize)),
+                                    18 | 20 => types.push(BcType::Struct(
+                                        ops[1..].iter().map(|&x| x as usize).collect(),
+                                    )),
+                                    21 => types.push(BcType::Func {
+                                        ret: ops[1] as usize,
+                                    }),
+                                    _ => types.push(BcType::Other),
+                                }
+                            }
+                            other => panic!("unexpected TYPE_BLOCK entry {other}"),
+                        }
+                    },
+                    11 => {
+                        let mut cur_ty = 0usize;
+                        loop {
+                            match r.read(width) {
+                                0 => {
+                                    r.align32();
+                                    break;
+                                }
+                                3 => {
+                                    let code = r.vbr(6);
+                                    let n = r.vbr(6);
+                                    let ops: Vec<u64> = (0..n).map(|_| r.vbr(6)).collect();
+                                    match code {
+                                        1 => cur_ty = ops[0] as usize,
+                                        4 => {
+                                            int_consts.insert(val_ty.len(), decode_signed(ops[0]));
+                                            val_ty.push(BcValTy::Ty(cur_ty));
+                                        }
+                                        3 | 6 | 7 => val_ty.push(BcValTy::Ty(cur_ty)),
+                                        _ => panic!("unexpected CONSTANTS_BLOCK code {code}"),
+                                    }
+                                }
+                                other => panic!("unexpected CONSTANTS_BLOCK entry {other}"),
+                            }
+                        }
+                    }
+                    14 => loop {
+                        match r.read(width) {
+                            0 => {
+                                r.align32();
+                                break;
+                            }
+                            3 => {
+                                let code = r.vbr(6);
+                                let n = r.vbr(6);
+                                let ops: Vec<u64> = (0..n).map(|_| r.vbr(6)).collect();
+                                if code == 1 {
+                                    let s: String =
+                                        ops[1..].iter().map(|&c| c as u8 as char).collect();
+                                    names.insert(ops[0] as usize, s);
+                                }
+                            }
+                            other => panic!("unexpected VALUE_SYMTAB_BLOCK entry {other}"),
+                        }
+                    },
+                    12 => {
+                        let mut cur_blk = 0usize;
+                        loop {
+                            match r.read(width) {
+                                0 => {
+                                    r.align32();
+                                    break;
+                                }
+                                3 => {
+                                    let code = r.vbr(6);
+                                    let n = r.vbr(6);
+                                    let ops: Vec<u64> = (0..n).map(|_| r.vbr(6)).collect();
+                                    let next_id = val_ty.len();
+                                    let rel = |x: u64| next_id - x as usize;
+                                    match code {
+                                        1 => {
+                                            blocks = (0..ops[0] as usize)
+                                                .map(|_| BcBlock::default())
+                                                .collect();
+                                        }
+                                        2 => {
+                                            let (lhs, rhs, op) = (rel(ops[0]), rel(ops[1]), ops[2]);
+                                            let ty = val_ty[lhs];
+                                            let is_float = matches!(
+                                                ty,
+                                                BcValTy::Ty(t) if matches!(types[t], BcType::Float)
+                                            );
+                                            let idx = blocks[cur_blk].insts.len();
+                                            blocks[cur_blk].insts.push(BcInst::Bin {
+                                                op,
+                                                is_float,
+                                                lhs,
+                                                rhs,
+                                            });
+                                            inst_by_id.insert(next_id, (cur_blk, idx));
+                                            val_ty.push(ty);
+                                        }
+                                        3 => {
+                                            let (dst_ty, op) = (ops[1] as usize, ops[2]);
+                                            let dst_is_float =
+                                                matches!(types[dst_ty], BcType::Float);
+                                            let idx = blocks[cur_blk].insts.len();
+                                            blocks[cur_blk]
+                                                .insts
+                                                .push(BcInst::Cast { op, dst_is_float });
+                                            inst_by_id.insert(next_id, (cur_blk, idx));
+                                            val_ty.push(BcValTy::Ty(dst_ty));
+                                        }
+                                        10 => {
+                                            blocks[cur_blk].term = Some(BcTerm::Ret);
+                                            cur_blk += 1;
+                                        }
+                                        11 => {
+                                            blocks[cur_blk].term = Some(if ops.len() == 1 {
+                                                BcTerm::Br(ops[0] as usize)
+                                            } else {
+                                                BcTerm::CondBr {
+                                                    cond: rel(ops[2]),
+                                                    t: ops[0] as usize,
+                                                    f: ops[1] as usize,
+                                                }
+                                            });
+                                            cur_blk += 1;
+                                        }
+                                        16 => {
+                                            let ty = ops[0] as usize;
+                                            let is_float = matches!(types[ty], BcType::Float);
+                                            let incoming = ops[1..]
+                                                .as_chunks::<2>()
+                                                .0
+                                                .iter()
+                                                .map(|c| {
+                                                    let v = (next_id as i64 - decode_signed(c[0]))
+                                                        as usize;
+                                                    (v, c[1] as usize)
+                                                })
+                                                .collect();
+                                            let idx = blocks[cur_blk].insts.len();
+                                            blocks[cur_blk]
+                                                .insts
+                                                .push(BcInst::Phi { is_float, incoming });
+                                            inst_by_id.insert(next_id, (cur_blk, idx));
+                                            val_ty.push(BcValTy::Ty(ty));
+                                        }
+                                        20 => {
+                                            let ty = ops[1] as usize;
+                                            let idx = blocks[cur_blk].insts.len();
+                                            blocks[cur_blk].insts.push(BcInst::Other);
+                                            inst_by_id.insert(next_id, (cur_blk, idx));
+                                            val_ty.push(BcValTy::Ty(ty));
+                                        }
+                                        26 => {
+                                            let ty = field_ty(
+                                                &types,
+                                                val_ty[rel(ops[0])],
+                                                ops[1] as usize,
+                                            );
+                                            let idx = blocks[cur_blk].insts.len();
+                                            blocks[cur_blk].insts.push(BcInst::Other);
+                                            inst_by_id.insert(next_id, (cur_blk, idx));
+                                            val_ty.push(ty);
+                                        }
+                                        28 => {
+                                            let (lhs, rhs, pred) =
+                                                (rel(ops[0]), rel(ops[1]), ops[2] as u8);
+                                            let idx = blocks[cur_blk].insts.len();
+                                            blocks[cur_blk].insts.push(BcInst::Cmp {
+                                                pred,
+                                                lhs,
+                                                rhs,
+                                            });
+                                            inst_by_id.insert(next_id, (cur_blk, idx));
+                                            val_ty.push(BcValTy::Other);
+                                        }
+                                        29 => {
+                                            let ty = val_ty[rel(ops[0])];
+                                            let idx = blocks[cur_blk].insts.len();
+                                            blocks[cur_blk].insts.push(BcInst::Other);
+                                            inst_by_id.insert(next_id, (cur_blk, idx));
+                                            val_ty.push(ty);
+                                        }
+                                        34 => {
+                                            let fty = ops[2] as usize;
+                                            let fn_id = rel(ops[3]);
+                                            let callee =
+                                                names.get(&fn_id).cloned().unwrap_or_default();
+                                            let BcType::Func { ret } = types[fty] else {
+                                                panic!("call target not a function type");
+                                            };
+                                            let idx = blocks[cur_blk].insts.len();
+                                            blocks[cur_blk].insts.push(BcInst::Call { callee });
+                                            if !matches!(types[ret], BcType::Void) {
+                                                inst_by_id.insert(next_id, (cur_blk, idx));
+                                                val_ty.push(BcValTy::Ty(ret));
+                                            }
+                                        }
+                                        38 => {
+                                            let ty = val_ty[rel(ops[1])];
+                                            let idx = blocks[cur_blk].insts.len();
+                                            blocks[cur_blk].insts.push(BcInst::Other);
+                                            inst_by_id.insert(next_id, (cur_blk, idx));
+                                            val_ty.push(ty);
+                                        }
+                                        43 | 46 => {
+                                            let idx = blocks[cur_blk].insts.len();
+                                            blocks[cur_blk].insts.push(BcInst::Other);
+                                            inst_by_id.insert(next_id, (cur_blk, idx));
+                                            val_ty.push(BcValTy::Other);
+                                        }
+                                        44 => {
+                                            blocks[cur_blk].insts.push(BcInst::Other);
+                                        }
+                                        other => panic!("unexpected FUNCTION_BLOCK code {other}"),
+                                    }
+                                }
+                                other => panic!("unexpected FUNCTION_BLOCK entry {other}"),
+                            }
+                        }
+                    }
+                    _ => r.skip_words(words),
+                }
+            }
+            3 => {
+                let code = r.vbr(6);
+                let n = r.vbr(6);
+                for _ in 0..n {
+                    let _ = r.vbr(6);
+                }
+                if matches!(code, 7 | 8) {
+                    val_ty.push(BcValTy::Other);
+                }
+            }
+            other => panic!("unexpected MODULE_BLOCK entry {other}"),
+        }
+    }
+
+    DecodedModule {
+        blocks,
+        int_consts,
+        inst_by_id,
+    }
+}
+
+/// Zero-GPU bitcode + `dxil.dll` validator proof that `bvh_lanes` dispatches
+/// box, triangle, and non-intersected types into mutually exclusive blocks,
+/// keeps all node loads before the dispatch branch, guards `box16`
+/// `legacyF16ToF32` unpacks behind `is16`, and hoists ray sign checks.
+#[test]
+fn bvh_dispatch_branches_by_node_type_and_guards_box16() {
+    for (wide, memory, guarded) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, true, false),
+        (false, false, true),
+        (true, true, true),
+    ] {
+        let shader = build_with(wide, memory, guarded);
+        if let Some(path) = std::env::var_os("VICTORY_DXIL") {
+            let mut v = validator::Validator::load(Some(std::path::Path::new(&path)))
+                .expect("VICTORY_DXIL failed to load");
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        let m = decode_dxil_module(&shader.dxil);
+
+        // 1. All 24 `legacyF16ToF32` unpacks live together in one `box16` block.
+        let box16_blks: Vec<usize> = (0..m.blocks.len())
+            .filter(|&b| {
+                m.blocks[b].insts.iter().any(|inst| {
+                    matches!(inst, BcInst::Call { callee } if callee == "dx.op.legacyF16ToF32")
+                })
+            })
+            .collect();
+        assert_eq!(
+            box16_blks.len(),
+            1,
+            "expected a single box16 unpack block (wide={wide}, memory={memory}, guarded={guarded})"
+        );
+        let box16_blk = box16_blks[0];
+        let f16_calls = m.blocks[box16_blk]
+            .insts
+            .iter()
+            .filter(
+                |inst| matches!(inst, BcInst::Call { callee } if callee == "dx.op.legacyF16ToF32"),
+            )
+            .count();
+        assert_eq!(f16_calls, 24, "box16 block should unpack all 24 bounds");
+
+        // 2. `box16_blk` is guarded directly by `is16` (`icmp eq ty, 4`) against `box32_blk`.
+        let box16_preds = m.preds(box16_blk);
+        assert_eq!(box16_preds.len(), 1);
+        let box_head = box16_preds[0];
+        let Some(BcTerm::CondBr {
+            cond: is16_id,
+            t,
+            f: box32_blk,
+        }) = m.blocks[box_head].term
+        else {
+            panic!("box_head must end in CondBr(is16, box16, box32)");
+        };
+        assert_eq!(t, box16_blk);
+        assert_ne!(box32_blk, box16_blk);
+        assert!(!m.can_reach(box16_blk, box32_blk) && !m.can_reach(box32_blk, box16_blk));
+        let &BcInst::Cmp {
+            pred: pred::EQ,
+            lhs: ty_id,
+            rhs: c4_id,
+        } = m.inst(is16_id)
+        else {
+            panic!("is16 must be `icmp eq ty, 4`");
+        };
+        assert_eq!(m.int_consts.get(&c4_id), Some(&4));
+
+        // `box32_blk` bitcasts 24 f32 bounds and runs zero `legacyF16ToF32` calls.
+        assert!(
+            !m.blocks[box32_blk].insts.iter().any(|inst| {
+                matches!(inst, BcInst::Call { callee } if callee == "dx.op.legacyF16ToF32")
+            }),
+            "box32 arm must not call legacyF16ToF32"
+        );
+        let f32_bitcasts = m.blocks[box32_blk]
+            .insts
+            .iter()
+            .filter(|inst| {
+                matches!(
+                    inst,
+                    BcInst::Cast { op, dst_is_float: true } if *op == Cast::Bitcast as u64
+                )
+            })
+            .count();
+        assert_eq!(f32_bitcasts, 24, "box32 block should bitcast 24 bounds");
+
+        // 3. Both box16 and box32 join at `slab_blk` with 24 f32 phis and 3 hoisted OGE checks.
+        let (Some(BcTerm::Br(slab_blk)), Some(BcTerm::Br(slab_from_32))) =
+            (m.blocks[box16_blk].term, m.blocks[box32_blk].term)
+        else {
+            panic!("box16 and box32 arms must unconditionally branch to slab join");
+        };
+        assert_eq!(slab_blk, slab_from_32);
+        let slab_f32_phis: Vec<_> = m.blocks[slab_blk]
+            .insts
+            .iter()
+            .filter_map(|inst| match inst {
+                BcInst::Phi {
+                    is_float: true,
+                    incoming,
+                } => Some(incoming),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            slab_f32_phis.len(),
+            24,
+            "slab block must merge 24 f32 bounds"
+        );
+        for incoming in slab_f32_phis {
+            let mut from: Vec<usize> = incoming.iter().map(|&(_, b)| b).collect();
+            from.sort_unstable();
+            let mut want = vec![box16_blk, box32_blk];
+            want.sort_unstable();
+            assert_eq!(from, want);
+        }
+        let slab_oge = m.blocks[slab_blk]
+            .insts
+            .iter()
+            .filter(|inst| {
+                matches!(
+                    inst,
+                    BcInst::Cmp {
+                        pred: pred::OGE,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            slab_oge, 3,
+            "ray sign check (ray.inv[a] >= 0) must be hoisted to 3 OGE compares"
+        );
+
+        // 4. `bvh_triangle` (`fdiv` + edge cross products) lives in its own block,
+        //    mutually exclusive with every `bvh_box` block.
+        let tri_blks: Vec<usize> = (0..m.blocks.len())
+            .filter(|&b| {
+                m.blocks[b].insts.iter().any(|inst| {
+                    matches!(
+                        inst,
+                        BcInst::Bin { op, is_float: true, .. } if *op == Bin::SDiv as u64
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(tri_blks.len(), 1, "expected a single triangle block");
+        let tri_blk = tri_blks[0];
+        for box_blk in [box_head, box16_blk, box32_blk, slab_blk] {
+            assert_ne!(box_blk, tri_blk);
+            assert!(
+                !m.can_reach(box_blk, tri_blk) && !m.can_reach(tri_blk, box_blk),
+                "box block {box_blk} and triangle block {tri_blk} must be mutually exclusive"
+            );
+        }
+        let tri_fmuls = m.blocks[tri_blk]
+            .insts
+            .iter()
+            .filter(|inst| {
+                matches!(
+                    inst,
+                    BcInst::Bin { op, is_float: true, .. } if *op == Bin::Mul as u64
+                )
+            })
+            .count();
+        assert!(
+            tri_fmuls >= 15,
+            "triangle block should contain shear and cross products"
+        );
+
+        // 5. `dispatch_blk` branches on `is_box` -> `box_head` / `other_blk`;
+        //    `other_blk` branches on `is_tri` -> `tri_blk` / `join_blk`;
+        //    `join_blk` merges `(slab_blk, tri_blk, other_blk)` with 4 i32 phis.
+        let box_head_preds = m.preds(box_head);
+        assert_eq!(box_head_preds.len(), 1);
+        let dispatch_blk = box_head_preds[0];
+        let Some(BcTerm::CondBr {
+            cond: is_box_id,
+            t: box_t,
+            f: other_blk,
+        }) = m.blocks[dispatch_blk].term
+        else {
+            panic!("dispatch_blk must end in CondBr(is_box, box_head, other_blk)");
+        };
+        assert_eq!(box_t, box_head);
+        let &BcInst::Cmp {
+            pred: pred::EQ,
+            lhs: t6_id,
+            rhs: c4_box,
+        } = m.inst(is_box_id)
+        else {
+            panic!("is_box must be `icmp eq (ty & 6), 4`");
+        };
+        assert_eq!(m.int_consts.get(&c4_box), Some(&4));
+        let &BcInst::Bin {
+            op: t6_op,
+            is_float: false,
+            lhs: t6_ty,
+            rhs: c6_id,
+        } = m.inst(t6_id)
+        else {
+            panic!("t6 must be `and ty, 6`");
+        };
+        assert_eq!(t6_op, Bin::And as u64);
+        assert_eq!(t6_ty, ty_id);
+        assert_eq!(m.int_consts.get(&c6_id), Some(&6));
+
+        let Some(BcTerm::CondBr {
+            cond: is_tri_id,
+            t: tri_t,
+            f: join_blk,
+        }) = m.blocks[other_blk].term
+        else {
+            panic!("other_blk must end in CondBr(is_tri, tri_blk, join_blk)");
+        };
+        assert_eq!(tri_t, tri_blk);
+        let &BcInst::Cmp {
+            pred: pred::IULT,
+            lhs: tri_ty,
+            rhs: c4_tri,
+        } = m.inst(is_tri_id)
+        else {
+            panic!("is_tri must be `icmp ult ty, 4`");
+        };
+        assert_eq!(tri_ty, ty_id);
+        assert_eq!(m.int_consts.get(&c4_tri), Some(&4));
+
+        assert!(matches!(m.blocks[slab_blk].term, Some(BcTerm::Br(j)) if j == join_blk));
+        assert!(matches!(m.blocks[tri_blk].term, Some(BcTerm::Br(j)) if j == join_blk));
+
+        let join_i32_phis: Vec<_> = m.blocks[join_blk]
+            .insts
+            .iter()
+            .filter_map(|inst| match inst {
+                BcInst::Phi {
+                    is_float: false,
+                    incoming,
+                } => Some(incoming),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            join_i32_phis.len(),
+            4,
+            "join block must merge 4 i32 result dwords"
+        );
+        let mut want_preds = vec![slab_blk, tri_blk, other_blk];
+        want_preds.sort_unstable();
+        for incoming in join_i32_phis {
+            let mut from: Vec<usize> = incoming.iter().map(|&(_, b)| b).collect();
+            from.sort_unstable();
+            assert_eq!(from, want_preds);
+        }
+
+        // 6. WARP safety: no memory loads or title-memory atomics live inside
+        //    any of the new ALU dispatch blocks.
+        for alu_blk in [box_head, box16_blk, box32_blk, slab_blk, other_blk, tri_blk] {
+            for inst in &m.blocks[alu_blk].insts {
+                if let BcInst::Call { callee } = inst {
+                    assert!(
+                        !callee.contains("Load") && !callee.contains("atomic"),
+                        "memory op {callee} must stay outside ALU dispatch block {alu_blk}"
+                    );
+                }
+            }
+        }
+    }
 }
