@@ -349,21 +349,9 @@ impl HostPipeline {
         }
         let host = host()?;
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
-        let atomics64 = stages.iter().any(|(s, _)| {
-            let Some(t) = s.translated() else {
-                return false;
-            };
-            victory_shader::Container::parse(&t.host.dxil)
-                .ok()
-                .and_then(|c| {
-                    c.part(victory_shader::FourCC::SFI0)?
-                        .data
-                        .get(..4)?
-                        .try_into()
-                        .ok()
-                })
-                .is_some_and(|b: [u8; 4]| u32::from_le_bytes(b) & 0x1040_0000 != 0)
-        });
+        let atomics64 = stages
+            .iter()
+            .any(|(s, _)| s.translated().is_some_and(|t| t.atomics64));
         if atomics64 && !host.heap_atomics64() {
             return refuse(
                 "the host GPU has no 64-bit atomics on typed heap resources",
