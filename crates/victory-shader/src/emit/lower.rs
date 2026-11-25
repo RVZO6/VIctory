@@ -229,6 +229,8 @@ struct Lower<'a> {
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
+    /// Per IR block: whether the block contains a `done` export.
+    done_export: Vec<bool>,
     /// Reverse-postorder index per IR block.
     rpo: Vec<usize>,
     /// DXIL block each IR block ends in (guarded stores split blocks).
@@ -266,8 +268,11 @@ struct Lower<'a> {
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
     balloting: HashSet<Value>,
-    /// Block writing each value.
-    def_block: HashMap<Value, usize>,
+    /// Block defining each value (phi or instruction), indexed by `Value.0`.
+    def_block: Vec<Option<usize>>,
+    /// Instruction site `(block, index)` defining each value, indexed by
+    /// `Value.0` (`None` for phis and program inputs).
+    def_site: Vec<Option<Site>>,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
@@ -634,6 +639,40 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let exports: HashMap<Site, &'a Export> = x.io.exports.iter().map(|e| (e.site, e)).collect();
+        let mut done_export = vec![false; p.blocks.len()];
+        for (&(b, i), e) in &exports {
+            if e.done && p.blocks.get(b).is_some_and(|block| i < block.insts.len()) {
+                done_export[b] = true;
+            }
+        }
+        let value_count = p
+            .inputs
+            .iter()
+            .map(|&(_, v)| v.0 as usize + 1)
+            .chain(p.blocks.iter().flat_map(|block| {
+                block.phis.iter().map(|phi| phi.value.0 as usize + 1).chain(
+                    block
+                        .insts
+                        .iter()
+                        .flat_map(|inst| inst.writes.iter().map(|&(_, v)| v.0 as usize + 1)),
+                )
+            }))
+            .max()
+            .unwrap_or(0);
+        let mut def_block = vec![None; value_count];
+        let mut def_site = vec![None; value_count];
+        for (b, block) in p.blocks.iter().enumerate() {
+            for phi in &block.phis {
+                def_block[phi.value.0 as usize] = Some(b);
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                for &(_, v) in &inst.writes {
+                    def_block[v.0 as usize] = Some(b);
+                    def_site[v.0 as usize] = Some((b, i));
+                }
+            }
+        }
         Lower {
             s,
             x,
@@ -665,13 +704,14 @@ impl<'a> Lower<'a> {
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
-            exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
+            exports,
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
             entry_handles: HashMap::new(),
             join_handles: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
+            done_export,
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
@@ -692,18 +732,8 @@ impl<'a> Lower<'a> {
             mask_ok: false,
             ballots: HashMap::new(),
             balloting: HashSet::new(),
-            def_block: p
-                .blocks
-                .iter()
-                .enumerate()
-                .flat_map(|(b, block)| {
-                    block
-                        .insts
-                        .iter()
-                        .flat_map(move |i| i.writes.iter().map(move |w| (w.1, b)))
-                        .chain(block.phis.iter().map(move |phi| (phi.value, b)))
-                })
-                .collect(),
+            def_block,
+            def_site,
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
@@ -1408,8 +1438,7 @@ impl<'a> Lower<'a> {
     }
 
     fn has_done_export(&self, b: usize) -> bool {
-        (0..self.x.p.blocks[b].insts.len())
-            .any(|i| self.exports.get(&(b, i)).is_some_and(|e| e.done))
+        self.done_export.get(b).copied().unwrap_or(false)
     }
 
     /// Values of the program's input registers.
@@ -1817,11 +1846,11 @@ impl<'a> Lower<'a> {
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
             None => {
-                let at = match self.def_block.get(&lo) {
+                let at = match self.def_block(lo) {
                     // Program inputs (EXEC on entry).
                     None => self.s.entry,
-                    Some(&b) if b == self.cur_ir => self.cur,
-                    Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+                    Some(b) if b == self.cur_ir => self.cur,
+                    Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
@@ -1862,12 +1891,8 @@ impl<'a> Lower<'a> {
         {
             return Err("a register joining a lane mask and data, read as data");
         }
-        let &b = self.def_block.get(&lo).ok_or(ELSEWHERE)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))
-            .ok_or(ELSEWHERE)?;
+        let (b, i) = self.def_site(lo).ok_or(ELSEWHERE)?;
+        let inst = &p.blocks[b].insts[i];
         let Fields::Sop {
             dst: Some(Operand::Scalar { code, .. }),
             src,
@@ -2599,11 +2624,7 @@ impl<'a> Lower<'a> {
                 .find(|q| q.reg == h)
                 .map(|q| q.value);
         }
-        let b = *self.def_block.get(&lo)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+        let inst = self.def_inst(lo)?;
         let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
         inst.write(pick(reg)?)
     }
@@ -2619,6 +2640,9 @@ impl<'a> Lower<'a> {
     /// the `done` export later in block b without its own guard holding,
     /// i.e. is discarded there.
     fn discarded_at_done(&self, b: usize, i: usize) -> bool {
+        if !self.has_done_export(b) {
+            return false;
+        }
         let guards = &self.x.st.guards[b];
         let g = guards[i].unwrap_or(Bool::TRUE);
         self.exports.iter().any(|(&(eb, ei), e)| {
@@ -8999,7 +9023,7 @@ impl<'a> Lower<'a> {
             }
             return Some(never_nan);
         }
-        let Some(&b) = self.def_block.get(&v) else {
+        let Some((b, i)) = self.def_site(v) else {
             // A VGPR no one set reads zero.
             let vgpr = p
                 .inputs
@@ -9008,11 +9032,7 @@ impl<'a> Lower<'a> {
             let io = self.x.io.inputs.iter().any(|i| i.0 == v);
             return (vgpr && !io).then_some(true);
         };
-        let (i, inst) = p.blocks[b]
-            .insts
-            .iter()
-            .enumerate()
-            .find(|(_, i)| i.writes.iter().any(|w| w.1 == v))?;
+        let inst = &p.blocks[b].insts[i];
         let Fields::Valu(f) = &inst.fields else {
             return None;
         };
@@ -10185,14 +10205,20 @@ impl<'a> Lower<'a> {
         r
     }
 
+    /// The IR block defining `v` (a phi or instruction).
+    fn def_block(&self, v: Value) -> Option<usize> {
+        self.def_block.get(v.0 as usize).copied().flatten()
+    }
+
+    /// The instruction site `(block, index)` writing `v`.
+    fn def_site(&self, v: Value) -> Option<Site> {
+        self.def_site.get(v.0 as usize).copied().flatten()
+    }
+
     /// The instruction writing `v`.
     fn def_inst(&self, v: Value) -> Option<&'a Inst> {
-        let b = *self.def_block.get(&v)?;
-        let p = self.x.p;
-        p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == v))
+        let (b, i) = self.def_site(v)?;
+        Some(&self.x.p.blocks[b].insts[i])
     }
 
     /// The constant `v` holds, `env` giving phi values: moves of constants.
@@ -11745,6 +11771,106 @@ mod tests {
     }
 
     #[test]
+    fn def_tables_and_done_export_match_linear_scans() {
+        use std::collections::{HashMap, HashSet};
+
+        use super::Lower;
+        use crate::ir::{Reg, Value};
+
+        // Wave64 shader with entry pair s[0:1], multi-write s_mov_b64 s[6:7],
+        // a join phi pair, and a whole-float conversion.
+        let cs_words = [
+            0xBE86_04C1u32, // s_mov_b64 s[6:7], -1
+            0x7E04_0D00,    // v_cvt_f32_u32 v2, v0
+            0xBF06_8000,    // s_cmp_eq_u32 s0, 0
+            0xBF85_0001,    // s_cbranch_scc1 -> join
+            0xBE86_0400,    // s_mov_b64 s[6:7], s[0:1]
+            0xBF07_0706,    // join: s_cmp_lg_u32 s6, s7
+            0xBF85_0001,    // s_cbranch_scc1 -> end
+            0xBE84_0380,    // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let cs_native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![RootParam { sgprs: 2, ..root(RootType::Constants, 0, 0) }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo { rsrc2: 1 << 15 | 2 << 1, threads: [64, 1, 1] }),
+            code: cs_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&cs_native.code, true, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &cs_native.layout, cs_native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &cs_native).unwrap();
+        let parts = Parts {
+            native: &cs_native, p: &p, st: &st, io: &io, res: &res,
+            inputs: vec![], outputs: vec![], prims: vec![], mesh_stride: 0, view_marks: false,
+        };
+        let bad = HashMap::new();
+        let l = Lower::new(&parts, &bad);
+
+        let scan_site = |v: Value| {
+            p.blocks.iter().enumerate().find_map(|(b, blk)| {
+                blk.insts.iter().enumerate()
+                    .find(|(_, i)| i.writes.iter().any(|&(_, w)| w == v))
+                    .map(|(i, _)| (b, i))
+            })
+        };
+        let scan_block = |v: Value| {
+            p.blocks.iter().enumerate().find_map(|(b, blk)| {
+                (blk.phis.iter().any(|phi| phi.value == v)
+                    || blk.insts.iter().any(|i| i.writes.iter().any(|&(_, w)| w == v)))
+                .then_some(b)
+            })
+        };
+        for v in p.inputs.iter().map(|&(_, v)| v)
+            .chain(p.blocks.iter().flat_map(|b| b.phis.iter().map(|phi| phi.value)))
+            .chain(p.blocks.iter().flat_map(|b| b.insts.iter().flat_map(|i| i.writes.iter().map(|&(_, v)| v))))
+            .chain([Value(u32::MAX)])
+        {
+            assert_eq!(l.def_block(v), scan_block(v));
+            assert_eq!(l.def_site(v), scan_site(v));
+            assert_eq!(l.def_inst(v).map(std::ptr::from_ref), scan_site(v).map(|(b, i)| std::ptr::from_ref(&p.blocks[b].insts[i])));
+        }
+        let cvt = p.blocks[0].insts.iter().find(|i| i.name() == "v_cvt_f32_u32").unwrap().write(Reg::V(2)).unwrap();
+        assert_eq!(l.whole(cvt, &mut HashSet::new()), Some(true));
+
+        // Pixel shader: block 0 has no export, block 1 non-done export, block 2 done export.
+        let ps_words = [
+            0x7E00_0280u32, 0xBF06_8000, 0xBF85_0002,
+            0xF800_100F, 0x0000_0000, // exp mrt0 (done = false)
+            0xF800_180F, 0x0000_0000, // exp mrt0 done
+            S_ENDPGM,
+        ];
+        let ps_native = NativeProgram {
+            stage: HwStage::Ps, wave64: false, vgprs: 256,
+            layout: vec![root(RootType::Constants, 0, 0)], used: vec![],
+            io: StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: 0, patches: vec![] },
+            code: ps_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let ps_p = ir::build(&ps_native.code, false, 256).unwrap();
+        let ps_st = structure::structure(&ps_p).unwrap();
+        let ps_res = resource::track(&ps_p, &ps_native.layout, ps_native.stage, Some(&ps_st)).unwrap();
+        let ps_io = io::raise(&ps_p, &ps_native).unwrap();
+        let target0 = super::SigElement {
+            name: "SV_Target".into(), index: 0, kind: 16, comp: 9, interp: 0,
+            row: Some(0), col: 0, cols: 4, usage: 0, half: false,
+        };
+        let ps_parts = Parts {
+            native: &ps_native, p: &ps_p, st: &ps_st, io: &ps_io, res: &ps_res,
+            inputs: vec![], outputs: vec![target0], prims: vec![], mesh_stride: 0, view_marks: false,
+        };
+        let ps_l = Lower::new(&ps_parts, &bad);
+        for b in 0..=ps_p.blocks.len() {
+            let scan_done = ps_p.blocks.get(b).is_some_and(|blk| {
+                (0..blk.insts.len()).any(|i| ps_l.exports.get(&(b, i)).is_some_and(|e| e.done))
+            });
+            assert_eq!(ps_l.has_done_export(b), scan_done, "block {b}");
+        }
+    }
+
+    #[test]
     #[ignore = "benchmark"]
     fn bench_user_data_cache() {
         // 32 spilled user-data dwords (8 CBV rows) loaded 4x = 128 reads.
@@ -11788,5 +11914,65 @@ mod tests {
             emitted.cbuf_stats.extracts.len(),
             us
         );
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_o1_lookups_large_shader() {
+        // Large single-block pixel shader: 256 table descriptor loads +
+        // 2,048 wave64 ALU/mask/cvt ops + done MRT0 export.
+        let mut words = vec![0xBE84_0300u32, 0xBE85_0380, 0x7E00_0280];
+        for _ in 0..256 {
+            words.extend_from_slice(&[
+                0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+                0xE030_2000, 0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen
+                0x4A00_0102,              // v_add_nc_u32 v0, v2, v0
+            ]);
+        }
+        for _ in 0..1024 {
+            words.push(0x7E04_0D00); // v_cvt_f32_u32 v2, v0
+            words.push(0x0600_0102); // v_add_f32 v0, v2, v0
+        }
+        words.extend_from_slice(&[0xF800_180F, 0x0000_0000, S_ENDPGM]);
+        let native = NativeProgram {
+            stage: HwStage::Ps, wave64: false, vgprs: 256,
+            layout: vec![root(RootType::Table, 0, 0)],
+            used: vec![UsedResource {
+                kind: ResourceType::Srv, root: RootType::Table, table_offset_dwords: 0,
+                lower_bound: 0, stride: 4, dwords: 4, user_data: 0, slot: 0,
+            }],
+            io: StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: 0, patches: vec![] },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let target0 = || super::SigElement {
+            name: "SV_Target".into(), index: 0, kind: 16, comp: 9, interp: 0,
+            row: Some(0), col: 0, cols: 4, usage: 0, half: false,
+        };
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let _ = lower(&Parts {
+            native: &native, p: &p, st: &st, io: &io, res: &res,
+            inputs: vec![], outputs: vec![target0()], prims: vec![], mesh_stride: 0, view_marks: false,
+        }).unwrap();
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..10 {
+            let r = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            std::hint::black_box(r.descriptors.len());
+        }
+        let track_us = t0.elapsed().as_secs_f64() * 1e6 / 10.0;
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..10 {
+            let l = lower(&Parts {
+                native: &native, p: &p, st: &st, io: &io, res: &res,
+                inputs: vec![], outputs: vec![target0()], prims: vec![], mesh_stride: 0, view_marks: false,
+            }).unwrap();
+            std::hint::black_box(l.dxil.len());
+        }
+        let lower_us = t1.elapsed().as_secs_f64() * 1e6 / 10.0;
+        eprintln!("o1_lookups (256 loads + 2048 ALU, {} insts): track={track_us:.1} us, lower={lower_us:.1} us", p.blocks[0].insts.len());
     }
 }
