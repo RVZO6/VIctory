@@ -812,11 +812,17 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
+    // Pages shown elsewhere already: guarded here too if they are there.
+    victory_gpu::title_memory_aliased_batch((0..len / PAGE).filter_map(|k| {
+        let shown = physical.shown.get(&slice.key(k))?;
+        (!shown.is_empty()).then_some((base + k * PAGE, shown.as_slice()))
+    }));
     for k in 0..len / PAGE {
-        let shown = physical.shown.entry(slice.key(k)).or_default();
-        // Pages shown elsewhere already: guarded here too if they are there.
-        victory_gpu::title_memory_aliased(base + k * PAGE, shown);
-        shown.push(base + k * PAGE);
+        physical
+            .shown
+            .entry(slice.key(k))
+            .or_default()
+            .push(base + k * PAGE);
     }
     physical.views.insert(base, (len, slice));
     true

@@ -436,8 +436,9 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // bytes, `Shadow::gpu_writes`).
         let withheld = if pages + regions > 0 { writes.len() as u64 } else { 0 };
         let mut written = 0;
+        let mut scratch = Vec::new();
         for &(k, at) in writes.iter().take_while(|_| withheld == 0) {
-            let n = copies[k].copy_back_page(at as usize);
+            let n = copies[k].copy_back_page(at as usize, &mut scratch);
             tracing::debug!(
                 page = format_args!("{at:#x}"),
                 copy = format_args!("{:#x?}", copies[k].range()),
