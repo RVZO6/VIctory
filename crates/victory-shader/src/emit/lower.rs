@@ -21,6 +21,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+#[cfg(test)]
+mod user_data_tests;
 
 type Why = &'static str;
 
@@ -72,6 +74,9 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// Written `cbufferLoadLegacy.i32` calls and extracts in the module.
+    #[cfg(test)]
+    pub cbuf_stats: super::bitcode::CbufStats,
 }
 
 pub(crate) struct Parts<'a> {
@@ -206,6 +211,11 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Cached 4-dword rows (`index / 4`) loaded from the user-data CBV in the
+    /// entry block.
+    user_rows: HashMap<u32, V>,
+    /// Cached extracted user-data dwords (`index`) in the entry block.
+    user_vals: HashMap<u32, V>,
     /// Handles of root SRVs and UAVs read as bounded views, by user-data
     /// dword ([`Lower::root_view`]).
     root_views: HashMap<u32, V>,
@@ -669,6 +679,8 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            user_rows: HashMap::new(),
+            user_vals: HashMap::new(),
             root_views: HashMap::new(),
             samplers: Vec::new(),
             descriptors: x
@@ -1412,6 +1424,8 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            cbuf_stats: self.s.m.cbuf_load_stats(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -1738,25 +1752,38 @@ impl<'a> Lower<'a> {
         let index = u.index;
         self.user_reads.insert(index, u);
         self.s.user_data = self.s.user_data.max(index + 1);
-        let h = match self.user_data {
-            Some(h) => h,
+        if let Some(&v) = self.user_vals.get(&index) {
+            return v;
+        }
+        let entry = self.s.entry;
+        let row = index / 4;
+        let r = match self.user_rows.get(&row) {
+            Some(&r) => r,
             None => {
-                let h = self.s.user_data_handle();
-                self.user_data = Some(h);
-                h
+                let h = match self.user_data {
+                    Some(h) => h,
+                    None => {
+                        let h = self.s.user_data_handle();
+                        self.user_data = Some(h);
+                        h
+                    }
+                };
+                let ri = self.s.m.i32(row);
+                let r = self.s.op(
+                    entry,
+                    "cbufferLoadLegacy.i32",
+                    Attr::ReadOnly,
+                    self.s.t.cbuf_ret,
+                    59,
+                    &[h, ri],
+                );
+                self.user_rows.insert(row, r);
+                r
             }
         };
-        let entry = self.s.entry;
-        let row = self.s.m.i32(index / 4);
-        let r = self.s.op(
-            entry,
-            "cbufferLoadLegacy.i32",
-            Attr::ReadOnly,
-            self.s.t.cbuf_ret,
-            59,
-            &[h, row],
-        );
-        self.s.m.extract(entry, r, index % 4)
+        let v = self.s.m.extract(entry, r, index % 4);
+        self.user_vals.insert(index, v);
+        v
     }
 
     /// In a program that uses title memory, the address of the root SRV or
