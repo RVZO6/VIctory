@@ -291,7 +291,7 @@ pub(crate) struct HostPipeline {
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
-    pub(crate) name: String,
+    pub(crate) name: Arc<str>,
     /// Our root parameters of the view-mark table and the buffer views'
     /// written-pages bitmap, if a stage marks its writes through views
     /// (`victory_shader::emit`, "Write marks").
@@ -557,7 +557,7 @@ impl HostPipeline {
                 pso,
                 root,
                 stages: bound,
-                name: format!("{shaders:?}"),
+                name: Arc::from(format!("{shaders:?}")),
                 rectangles: false,
                 slots: 0,
                 inputs: Vec::new(),
@@ -591,7 +591,7 @@ impl HostPipeline {
                 pso,
                 root,
                 stages: bound,
-                name: format!("{shaders:?}"),
+                name: Arc::from(format!("{shaders:?}")),
                 rectangles: false,
                 slots: 0,
                 inputs: Vec::new(),
@@ -676,7 +676,7 @@ impl HostPipeline {
             pso,
             root,
             stages: bound,
-            name: format!("{shaders:?}"),
+            name: Arc::from(format!("{shaders:?}")),
             rectangles: !gs.is_empty(),
             slots: g.slots(),
             inputs: g.elements(),

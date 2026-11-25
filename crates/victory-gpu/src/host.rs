@@ -542,6 +542,205 @@ mod tests {
         node.pCommandListDebugNameA = longer.as_ptr().cast();
         assert!(!list.is_node(&node), "a number that only starts with ours is no match");
     }
+
+    #[test]
+    fn deferred_clear_retains_steady_state_capacity_and_shrinks_bursts() {
+        let mut d = Deferred::default();
+
+        // Steady-state population below RETAINED_CAP: capacities must survive clear().
+        const STEADY: usize = 32;
+        for i in 0..STEADY {
+            d.copies.push(Step::Memory(i));
+            d.kept.ptrs.insert(i);
+            d.refreshed.insert((i, 0, 64));
+            d.textures.insert(i);
+            d.writes.push((i, crate::queue::Written::Value(i as u64), 8));
+            d.after.push(Box::new(|| {}));
+            d.missed.push(Box::new(|| false));
+        }
+        d.uploads.reserve(STEADY);
+        d.kept.items.reserve(STEADY);
+        d.budget_zeroed = true;
+
+        let steady_caps = (
+            d.copies.capacity(),
+            d.uploads.capacity(),
+            d.kept.items.capacity(),
+            d.kept.ptrs.capacity(),
+            d.refreshed.capacity(),
+            d.textures.capacity(),
+            d.writes.capacity(),
+            d.after.capacity(),
+            d.missed.capacity(),
+        );
+        assert!(steady_caps.0 >= STEADY && steady_caps.0 <= RETAINED_CAP);
+        assert!(steady_caps.1 >= STEADY && steady_caps.1 <= RETAINED_CAP);
+        assert!(steady_caps.2 >= STEADY && steady_caps.2 <= RETAINED_CAP);
+        assert!(steady_caps.3 >= STEADY && steady_caps.3 <= RETAINED_CAP);
+        assert!(steady_caps.4 >= STEADY && steady_caps.4 <= RETAINED_CAP);
+        assert!(steady_caps.5 >= STEADY && steady_caps.5 <= RETAINED_CAP);
+        assert!(steady_caps.6 >= STEADY && steady_caps.6 <= RETAINED_CAP);
+        assert!(steady_caps.7 >= STEADY && steady_caps.7 <= RETAINED_CAP);
+        assert!(steady_caps.8 >= STEADY && steady_caps.8 <= RETAINED_CAP);
+
+        d.clear();
+
+        assert!(d.copies.is_empty());
+        assert!(d.uploads.is_empty());
+        assert!(d.kept.items.is_empty());
+        assert!(d.kept.ptrs.is_empty());
+        assert!(d.refreshed.is_empty());
+        assert!(d.textures.is_empty());
+        assert!(d.writes.is_empty());
+        assert!(!d.budget_zeroed);
+        assert!(d.after.is_empty());
+        assert!(d.missed.is_empty());
+        assert_eq!(
+            (
+                d.copies.capacity(),
+                d.uploads.capacity(),
+                d.kept.items.capacity(),
+                d.kept.ptrs.capacity(),
+                d.refreshed.capacity(),
+                d.textures.capacity(),
+                d.writes.capacity(),
+                d.after.capacity(),
+                d.missed.capacity(),
+            ),
+            steady_caps,
+            "steady-state capacities are preserved across Deferred::clear",
+        );
+
+        // Runaway burst well past RETAINED_CAP: clear() must shrink back to cap.
+        const BURST: usize = RETAINED_CAP * 4;
+        for i in 0..BURST {
+            d.copies.push(Step::Memory(i));
+            d.kept.ptrs.insert(i);
+            d.refreshed.insert((i, 0, 64));
+            d.textures.insert(i);
+            d.writes.push((i, crate::queue::Written::Value(i as u64), 8));
+            d.after.push(Box::new(|| {}));
+            d.missed.push(Box::new(|| false));
+        }
+        d.uploads.reserve_exact(BURST);
+        d.kept.items.reserve_exact(BURST);
+        d.budget_zeroed = true;
+
+        let burst_set_cap = d.textures.capacity();
+        assert!(d.copies.capacity() >= BURST);
+        assert!(d.uploads.capacity() >= BURST);
+        assert!(d.kept.items.capacity() >= BURST);
+        assert!(d.kept.ptrs.capacity() >= BURST);
+        assert!(d.refreshed.capacity() >= BURST);
+        assert!(burst_set_cap >= BURST);
+        assert!(d.writes.capacity() >= BURST);
+        assert!(d.after.capacity() >= BURST);
+        assert!(d.missed.capacity() >= BURST);
+
+        d.clear();
+
+        let set_cap_tier = std::collections::HashSet::<usize>::with_capacity(RETAINED_CAP).capacity();
+        assert!(!d.budget_zeroed);
+        assert_eq!(d.copies.capacity(), RETAINED_CAP);
+        assert_eq!(d.uploads.capacity(), RETAINED_CAP);
+        assert_eq!(d.kept.items.capacity(), RETAINED_CAP);
+        assert!(d.kept.ptrs.capacity() < burst_set_cap && d.kept.ptrs.capacity() <= set_cap_tier);
+        assert!(d.refreshed.capacity() < burst_set_cap && d.refreshed.capacity() <= set_cap_tier);
+        assert!(d.textures.capacity() < burst_set_cap && d.textures.capacity() <= set_cap_tier);
+        assert_eq!(d.writes.capacity(), RETAINED_CAP);
+        assert_eq!(d.after.capacity(), RETAINED_CAP);
+        assert_eq!(d.missed.capacity(), RETAINED_CAP);
+    }
+
+    #[test]
+    fn keep_set_deduplicates_by_pointer_and_re_retains_after_clear() {
+        let mut keep = KeepSet::<u32>::default();
+        let mut calls = 0usize;
+
+        assert!(keep.insert_with(0x1000, || {
+            calls += 1;
+            Some(1)
+        }));
+        assert!(!keep.insert_with(0x1000, || {
+            calls += 1;
+            Some(99)
+        }));
+        assert!(keep.insert_with(0x2000, || {
+            calls += 1;
+            Some(2)
+        }));
+        assert!(!keep.insert_with(0x2000, || {
+            calls += 1;
+            Some(99)
+        }));
+        assert_eq!(calls, 2);
+        assert_eq!(keep.items, vec![1, 2]);
+
+        // A failed retain must not poison the pointer set.
+        assert!(!keep.insert_with(0x3000, || {
+            calls += 1;
+            None
+        }));
+        assert_eq!(calls, 3);
+        assert!(!keep.ptrs.contains(&0x3000));
+        assert!(keep.insert_with(0x3000, || {
+            calls += 1;
+            Some(3)
+        }));
+        assert_eq!(calls, 4);
+        assert_eq!(keep.items, vec![1, 2, 3]);
+
+        // After clear(), previously seen pointers are retained again.
+        let (items_cap, ptrs_cap) = (keep.items.capacity(), keep.ptrs.capacity());
+        keep.clear(RETAINED_CAP);
+        assert!(keep.items.is_empty());
+        assert!(keep.ptrs.is_empty());
+        assert_eq!((keep.items.capacity(), keep.ptrs.capacity()), (items_cap, ptrs_cap));
+
+        assert!(keep.insert_with(0x1000, || {
+            calls += 1;
+            Some(10)
+        }));
+        assert_eq!(calls, 5);
+        assert_eq!(keep.items, vec![10]);
+    }
+
+    #[test]
+    fn collect_unique_heaps_deduplicates_by_pointer_in_order() {
+        use std::sync::Arc;
+
+        // Empty input does not allocate.
+        let empty: [Vec<Arc<u32>>; 2] = [Vec::new(), Vec::new()];
+        let none = collect_unique_heaps(&empty, |list, push| {
+            for item in list {
+                push(item);
+            }
+        });
+        assert!(none.is_empty());
+        assert_eq!(none.capacity(), 0);
+
+        let a = Arc::new(1u32);
+        let b = Arc::new(2u32);
+        let c = Arc::new(3u32);
+        // Same value as `a`, distinct allocation: pointer dedup keeps both.
+        let a_distinct = Arc::new(1u32);
+
+        let lists = [
+            vec![Arc::clone(&a), Arc::clone(&b), Arc::clone(&a)],
+            vec![Arc::clone(&b), Arc::clone(&c)],
+            vec![Arc::clone(&a_distinct), Arc::clone(&a), Arc::clone(&c)],
+        ];
+        let unique = collect_unique_heaps(&lists, |list, push| {
+            for item in list {
+                push(item);
+            }
+        });
+        assert_eq!(unique.len(), 4);
+        assert!(Arc::ptr_eq(&unique[0], &a));
+        assert!(Arc::ptr_eq(&unique[1], &b));
+        assert!(Arc::ptr_eq(&unique[2], &c));
+        assert!(Arc::ptr_eq(&unique[3], &a_distinct));
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -570,7 +769,7 @@ pub(crate) struct HostList {
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
-    pipelines: Mutex<std::collections::BTreeSet<String>>,
+    pipelines: Mutex<std::collections::BTreeSet<std::sync::Arc<str>>>,
     /// Which list this is, for the name that tells it apart in device-removed
     /// data (see [`HostList::is_node`]).
     id: u64,
@@ -735,6 +934,103 @@ enum Step {
     Memory(usize),
 }
 
+/// Maximum collection capacity retained across command-list resets: steady-state
+/// frames avoid heap re-allocations while one-off loading bursts release excess
+/// memory.
+pub(crate) const RETAINED_CAP: usize = 1024;
+
+pub(crate) fn clear_vec<T>(v: &mut Vec<T>, cap: usize) {
+    v.clear();
+    if v.capacity() > cap {
+        v.shrink_to(cap);
+    }
+}
+
+pub(crate) fn clear_set<T: Eq + std::hash::Hash>(
+    s: &mut std::collections::HashSet<T>,
+    cap: usize,
+) {
+    s.clear();
+    if s.capacity() > cap {
+        s.shrink_to(cap);
+    }
+}
+
+pub(crate) fn clear_map<K: Eq + std::hash::Hash, V>(
+    m: &mut std::collections::HashMap<K, V>,
+    cap: usize,
+) {
+    m.clear();
+    if m.capacity() > cap {
+        m.shrink_to(cap);
+    }
+}
+
+/// Host objects kept alive until a list is reset, deduplicated by raw pointer
+/// so repeated binds skip COM `QueryInterface`/`AddRef`.
+///
+/// Soundness: once `raw` is recorded in `ptrs`, a strong reference is held in
+/// `items` until [`KeepSet::clear`] runs after GPU execution finishes, so the
+/// object's address cannot be freed or reused while present in `ptrs`.
+struct KeepSet<T> {
+    items: Vec<T>,
+    ptrs: std::collections::HashSet<usize>,
+}
+
+impl<T> Default for KeepSet<T> {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            ptrs: std::collections::HashSet::new(),
+        }
+    }
+}
+
+impl<T> KeepSet<T> {
+    /// Retains `raw` at most once until [`KeepSet::clear`], invoking `retain`
+    /// only on the first sight of `raw`. If `retain` returns `None`, `raw` is
+    /// removed from `ptrs` so state stays consistent.
+    fn insert_with(&mut self, raw: usize, retain: impl FnOnce() -> Option<T>) -> bool {
+        if !self.ptrs.insert(raw) {
+            return false;
+        }
+        match retain() {
+            Some(item) => {
+                self.items.push(item);
+                true
+            }
+            None => {
+                self.ptrs.remove(&raw);
+                false
+            }
+        }
+    }
+
+    fn clear(&mut self, cap: usize) {
+        clear_set(&mut self.ptrs, cap);
+        clear_vec(&mut self.items, cap);
+    }
+}
+
+/// Collects unique `Arc<T>` items across `lists` in first-seen order,
+/// deduplicating by `Arc::as_ptr` without intermediate per-list allocations.
+fn collect_unique_heaps<L, T>(
+    lists: &[L],
+    mut visit: impl FnMut(&L, &mut dyn FnMut(&std::sync::Arc<T>)),
+) -> Vec<std::sync::Arc<T>> {
+    let mut heaps: Vec<std::sync::Arc<T>> = Vec::new();
+    let mut push = |heap: &std::sync::Arc<T>| {
+        let ptr = std::sync::Arc::as_ptr(heap);
+        if !heaps.iter().any(|h| std::sync::Arc::as_ptr(h) == ptr) {
+            heaps.push(std::sync::Arc::clone(heap));
+        }
+    };
+    for list in lists {
+        visit(list, &mut push);
+    }
+    heaps
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -746,7 +1042,7 @@ struct Deferred {
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
-    kept: Vec<windows::core::IUnknown>,
+    kept: KeepSet<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -764,6 +1060,34 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+}
+
+impl Deferred {
+    /// Clears all per-recording state in-place, retaining steady-state
+    /// capacities while shrinking runaway burst allocations back to
+    /// [`RETAINED_CAP`].
+    fn clear(&mut self) {
+        let Self {
+            copies,
+            uploads,
+            kept,
+            refreshed,
+            textures,
+            writes,
+            budget_zeroed,
+            after,
+            missed,
+        } = self;
+        clear_vec(copies, RETAINED_CAP);
+        clear_vec(uploads, RETAINED_CAP);
+        kept.clear(RETAINED_CAP);
+        clear_set(refreshed, RETAINED_CAP);
+        clear_set(textures, RETAINED_CAP);
+        clear_vec(writes, RETAINED_CAP);
+        *budget_zeroed = false;
+        clear_vec(after, RETAINED_CAP);
+        clear_vec(missed, RETAINED_CAP);
+    }
 }
 
 impl Host {
@@ -897,19 +1221,13 @@ impl Host {
         crate::descriptor::sync_heaps();
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
-        let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
-            .iter()
-            .flat_map(|l| {
-                l.deferred()
-                    .copies
-                    .iter()
-                    .filter_map(|s| match s {
-                        Step::Heap(v) => Some(v.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let heaps = collect_unique_heaps(runs, |list, push| {
+            for step in &list.deferred().copies {
+                if let Step::Heap(v) = step {
+                    push(v);
+                }
+            }
+        });
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
         let uploads = (!heaps.is_empty())
@@ -917,13 +1235,17 @@ impl Host {
             .flatten();
         #[cfg(feature = "diagnostics")]
         drop(uploading);
-        let runs: Vec<&HostList> = uploads
-            .as_ref()
-            .map(|u| u.list())
-            .into_iter()
-            .chain(runs.iter().copied())
-            .collect();
-        let runs = &runs[..];
+        let with_uploads: Vec<&HostList>;
+        let runs: &[&HostList] = match uploads.as_ref() {
+            Some(u) => {
+                let mut combined = Vec::with_capacity(runs.len() + 1);
+                combined.push(u.list());
+                combined.extend_from_slice(runs);
+                with_uploads = combined;
+                &with_uploads
+            }
+            None => runs,
+        };
         // A frame `crate::capture` lists: every command of every list, in
         // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
         // notes them).
@@ -1018,10 +1340,17 @@ impl Host {
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
-            let pipelines: std::collections::BTreeSet<String> = runs
-                .iter()
-                .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
-                .collect();
+            let mut pipelines: std::collections::BTreeSet<std::sync::Arc<str>> =
+                std::collections::BTreeSet::new();
+            for l in runs {
+                pipelines.extend(
+                    l.pipelines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .cloned(),
+                );
+            }
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
         }
         // SAFETY: a plain query.
@@ -1463,14 +1792,14 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        *self.deferred() = Deferred::default();
-        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.deferred().clear();
+        clear_map(&mut self.states.lock().unwrap_or_else(|e| e.into_inner()), RETAINED_CAP);
+        clear_map(&mut self.twins.lock().unwrap_or_else(|e| e.into_inner()), RETAINED_CAP);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        clear_vec(&mut self.notes.lock().unwrap_or_else(|e| e.into_inner()), RETAINED_CAP);
         #[cfg(feature = "diagnostics")]
-        self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        clear_vec(&mut self.targets.lock().unwrap_or_else(|e| e.into_inner()), RETAINED_CAP);
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -1688,10 +2017,10 @@ impl HostList {
     }
 
     /// Notes a pipeline the list binds.
-    pub(crate) fn used_pipeline(&self, name: &str) {
+    pub(crate) fn used_pipeline(&self, name: &std::sync::Arc<str>) {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-        if !pipelines.contains(name) {
-            pipelines.insert(name.to_owned());
+        if !pipelines.contains(name.as_ref()) {
+            pipelines.insert(std::sync::Arc::clone(name));
         }
     }
 
@@ -1859,9 +2188,10 @@ impl HostList {
 
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
-        if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
-        }
+        let raw = object.as_raw() as usize;
+        self.deferred()
+            .kept
+            .insert_with(raw, || object.cast::<windows::core::IUnknown>().ok());
     }
 
     /// Whether this is the first time since the reset that the list asks

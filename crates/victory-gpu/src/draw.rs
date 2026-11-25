@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
-use crate::host::HostList;
+use crate::host::{HostList, RETAINED_CAP, clear_map, clear_set, clear_vec};
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
@@ -89,16 +89,23 @@ pub(crate) struct State {
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
     root_run: (usize, u32, u32),
+    /// Host pipeline raw pointers already recorded on the current list via
+    /// [`HostList::used_pipeline`]: repeated binds skip locking
+    /// `HostList::pipelines`. Sound because [`HostList::keep`] keeps each
+    /// pipeline alive until the list and `State` are reset together.
+    seen_pipelines: std::collections::HashSet<usize>,
+}
+
+fn release_slot(heap: usize, first: u32, n: u32) {
+    match (heap, crate::memory::heap()) {
+        (MEMORY_HEAP, Some(ours)) => ours.release(first, n),
+        _ => crate::descriptor::release_dynamic(heap, first, n),
+    }
 }
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            match (heap, crate::memory::heap()) {
-                (MEMORY_HEAP, Some(ours)) => ours.release(first, n),
-                _ => crate::descriptor::release_dynamic(heap, first, n),
-            }
-        }
+        self.release_dynamic();
     }
 }
 
@@ -221,9 +228,80 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 }
 
 impl State {
+    /// Gives back every dynamic descriptor slot this list reserved.
+    fn release_dynamic(&mut self) {
+        self.release_dynamic_with(release_slot);
+    }
+
+    fn release_dynamic_with(&mut self, mut release: impl FnMut(usize, u32, u32)) {
+        for (heap, first, n) in self.dynamic.drain(..) {
+            release(heap, first, n);
+        }
+    }
+
     pub(crate) fn reset(&mut self, pipeline: This) {
-        *self = State::default();
-        self.pipeline = pipeline as usize;
+        self.release_dynamic();
+        self.reset_fields(pipeline);
+    }
+
+    #[cfg(test)]
+    fn reset_with(&mut self, pipeline: This, release: impl FnMut(usize, u32, u32)) {
+        self.release_dynamic_with(release);
+        self.reset_fields(pipeline);
+    }
+
+    /// Resets every field to match [`State::default`] (with `pipeline` bound),
+    /// retaining steady-state capacities while shrinking burst allocations back
+    /// to [`RETAINED_CAP`].
+    fn reset_fields(&mut self, pipeline: This) {
+        let Self {
+            pipeline: bound_pipeline,
+            heaps,
+            graphics,
+            compute,
+            vertex,
+            index,
+            targets,
+            depth,
+            topology,
+            host_pipeline,
+            host_roots,
+            host_heaps,
+            fresh_tables,
+            dynamic,
+            table_failed,
+            memory,
+            root_slots,
+            root_run,
+            seen_pipelines,
+        } = self;
+        *bound_pipeline = pipeline as usize;
+        *heaps = [0; 2];
+        clear_vec(graphics, RETAINED_CAP);
+        clear_vec(compute, RETAINED_CAP);
+        vertex.fill(VertexView::default());
+        *index = IndexView::default();
+        clear_vec(targets, RETAINED_CAP);
+        *depth = 0;
+        *topology = 0;
+        *host_pipeline = 0;
+        *host_roots = [0; 2];
+        *host_heaps = [0; 2];
+        clear_map(fresh_tables, RETAINED_CAP);
+        clear_vec(dynamic, RETAINED_CAP);
+        *table_failed = false;
+        *memory = None;
+        clear_map(root_slots, RETAINED_CAP);
+        *root_run = (0, 0, 0);
+        clear_set(seen_pipelines, RETAINED_CAP);
+    }
+
+    /// Records `pso` as seen on the current command list and invokes `record`
+    /// only on its first appearance since the last [`State::reset`].
+    fn note_pipeline(&mut self, pso: usize, record: impl FnOnce()) {
+        if self.seen_pipelines.insert(pso) {
+            record();
+        }
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -535,14 +613,15 @@ impl State {
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
+        let pso = p.pso.as_raw() as usize;
+        if self.host_pipeline != pso {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
-            self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
+            self.host_pipeline = pso;
             // The title may release the pipeline before it submits the list.
             list.keep(&p.pso);
             list.keep(&p.root);
+            self.note_pipeline(pso, || list.used_pipeline(&p.name));
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::binding(&p.name);
@@ -2491,5 +2570,227 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+
+    fn assert_matches_default(state: &State, expected_pipeline: usize) {
+        let fresh = State::default();
+        let State {
+            pipeline,
+            heaps,
+            graphics,
+            compute,
+            vertex,
+            index,
+            targets,
+            depth,
+            topology,
+            host_pipeline,
+            host_roots,
+            host_heaps,
+            fresh_tables,
+            dynamic,
+            table_failed,
+            memory,
+            root_slots,
+            root_run,
+            seen_pipelines,
+        } = state;
+        assert_eq!(*pipeline, expected_pipeline);
+        assert_eq!(*heaps, fresh.heaps);
+        assert!(graphics.is_empty());
+        assert!(compute.is_empty());
+        for (got, want) in vertex.iter().zip(&fresh.vertex) {
+            assert_eq!(
+                (got.address, got.size, got.stride),
+                (want.address, want.size, want.stride),
+            );
+        }
+        assert_eq!(
+            (index.address, index.size, index.format),
+            (fresh.index.address, fresh.index.size, fresh.index.format),
+        );
+        assert!(targets.is_empty());
+        assert_eq!(*depth, fresh.depth);
+        assert_eq!(*topology, fresh.topology);
+        assert_eq!(*host_pipeline, fresh.host_pipeline);
+        assert_eq!(*host_roots, fresh.host_roots);
+        assert_eq!(*host_heaps, fresh.host_heaps);
+        assert!(fresh_tables.is_empty());
+        assert!(dynamic.is_empty());
+        assert_eq!(*table_failed, fresh.table_failed);
+        assert!(memory.is_none());
+        assert!(root_slots.is_empty());
+        assert_eq!(*root_run, fresh.root_run);
+        assert!(seen_pipelines.is_empty());
+    }
+
+    #[test]
+    fn state_reset_releases_dynamic_resets_all_fields_and_retains_capacity() {
+        let mut state = State::default();
+        state.pipeline = 0x1111;
+        state.heaps = [0x2222, 0x3333];
+        state.set_table(false, 0, 0x4444);
+        state.set_constants(false, 1, &[1, 2, 3], 0);
+        state.set_view(true, 0, 0x5555);
+        for (i, slot) in state.vertex.iter_mut().enumerate() {
+            *slot = VertexView {
+                address: 0x1000 + i as u64,
+                size: 256,
+                stride: 16,
+            };
+        }
+        state.index = IndexView {
+            address: 0x9000,
+            size: 128,
+            format: 57,
+        };
+        state.targets.extend([0xa000, 0xb000]);
+        state.depth = 0xc000;
+        state.topology = 4;
+        state.host_pipeline = 0xd000;
+        state.host_roots = [0xe000, 0xe008];
+        state.host_heaps = [0xf000, 0xf008];
+        for i in 0..16u64 {
+            state.fresh_tables.insert((i, i * 3), i as u32);
+            state.dynamic.push((0x1000 + i as usize, i as u32 * 4, 4));
+            state.root_slots.insert((0x1000, i as usize, i % 2 == 0), i as u32);
+            state.seen_pipelines.insert(0x2000 + i as usize);
+        }
+        state.table_failed = true;
+        state.root_run = (0x1000, 12, 256);
+
+        let expected_released = state.dynamic.clone();
+        let steady_caps = (
+            state.graphics.capacity(),
+            state.compute.capacity(),
+            state.targets.capacity(),
+            state.fresh_tables.capacity(),
+            state.dynamic.capacity(),
+            state.root_slots.capacity(),
+            state.seen_pipelines.capacity(),
+        );
+        assert!(steady_caps.0 > 0 && steady_caps.0 <= RETAINED_CAP);
+        assert!(steady_caps.1 > 0 && steady_caps.1 <= RETAINED_CAP);
+        assert!(steady_caps.2 > 0 && steady_caps.2 <= RETAINED_CAP);
+        assert!(steady_caps.3 > 0 && steady_caps.3 <= RETAINED_CAP);
+        assert!(steady_caps.4 > 0 && steady_caps.4 <= RETAINED_CAP);
+        assert!(steady_caps.5 > 0 && steady_caps.5 <= RETAINED_CAP);
+        assert!(steady_caps.6 > 0 && steady_caps.6 <= RETAINED_CAP);
+
+        let next_pipeline = 0x7777usize as This;
+        let mut released = Vec::new();
+        state.reset_with(next_pipeline, |heap, first, n| {
+            released.push((heap, first, n));
+        });
+
+        assert_eq!(released, expected_released);
+        assert_matches_default(&state, next_pipeline as usize);
+        assert_eq!(
+            (
+                state.graphics.capacity(),
+                state.compute.capacity(),
+                state.targets.capacity(),
+                state.fresh_tables.capacity(),
+                state.dynamic.capacity(),
+                state.root_slots.capacity(),
+                state.seen_pipelines.capacity(),
+            ),
+            steady_caps,
+            "steady-state capacities are preserved across State::reset",
+        );
+
+        // A second reset does not double-release dynamic slots.
+        let mut released_again = Vec::new();
+        state.reset_with(std::ptr::null(), |heap, first, n| {
+            released_again.push((heap, first, n));
+        });
+        assert!(released_again.is_empty());
+
+        // Direct State::reset handles unregistered heap keys cleanly with no GPU.
+        state.dynamic.push((0xdead_beef, 0, 8));
+        state.reset(0x8888usize as This);
+        assert_matches_default(&state, 0x8888);
+
+        // Runaway burst shrinks all collections back to RETAINED_CAP tier.
+        const BURST: usize = RETAINED_CAP * 4;
+        for i in 0..BURST {
+            state.graphics.push(Root::View(i as u64));
+            state.compute.push(Root::Table(i as u64));
+            state.targets.push(i);
+            state.fresh_tables.insert((i as u64, 0), i as u32);
+            state.dynamic.push((i, 0, 1));
+            state.root_slots.insert((i, 0, false), i as u32);
+            state.seen_pipelines.insert(i);
+        }
+        let burst_map_cap = state.fresh_tables.capacity();
+        let burst_root_cap = state.root_slots.capacity();
+        let burst_seen_cap = state.seen_pipelines.capacity();
+        state.reset_with(std::ptr::null(), |_, _, _| {});
+
+        let map_tier = std::collections::HashMap::<(u64, u64), u32>::with_capacity(RETAINED_CAP).capacity();
+        let root_tier = std::collections::HashMap::<(usize, usize, bool), u32>::with_capacity(RETAINED_CAP).capacity();
+        let set_tier = std::collections::HashSet::<usize>::with_capacity(RETAINED_CAP).capacity();
+        assert_eq!(state.graphics.capacity(), RETAINED_CAP);
+        assert_eq!(state.compute.capacity(), RETAINED_CAP);
+        assert_eq!(state.targets.capacity(), RETAINED_CAP);
+        assert_eq!(state.dynamic.capacity(), RETAINED_CAP);
+        assert!(state.fresh_tables.capacity() < burst_map_cap && state.fresh_tables.capacity() <= map_tier);
+        assert!(state.root_slots.capacity() < burst_root_cap && state.root_slots.capacity() <= root_tier);
+        assert!(state.seen_pipelines.capacity() < burst_seen_cap && state.seen_pipelines.capacity() <= set_tier);
+    }
+
+    #[test]
+    fn seen_pipelines_skips_duplicates_and_resets() {
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+
+        let mut state = State::default();
+        let name_a: Arc<str> = Arc::from("[vs_a, ps_a]");
+        let name_b: Arc<str> = Arc::from("[vs_b, ps_b]");
+        let mut recorded: BTreeSet<Arc<str>> = BTreeSet::new();
+        let mut calls = 0usize;
+
+        state.note_pipeline(0x1000, || {
+            calls += 1;
+            recorded.insert(Arc::clone(&name_a));
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(Arc::strong_count(&name_a), 2);
+
+        // Same pipeline bound again on the same list: skipped without locking.
+        state.note_pipeline(0x1000, || {
+            calls += 1;
+            recorded.insert(Arc::clone(&name_a));
+        });
+        assert_eq!(calls, 1);
+
+        // Even after host_state_lost() clears host_pipeline mid-list, seen_pipelines still dedups.
+        state.host_state_lost();
+        state.note_pipeline(0x1000, || {
+            calls += 1;
+            recorded.insert(Arc::clone(&name_a));
+        });
+        assert_eq!(calls, 1);
+
+        // Another pipeline records once.
+        state.note_pipeline(0x2000, || {
+            calls += 1;
+            recorded.insert(Arc::clone(&name_b));
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(recorded.len(), 2);
+
+        // Reset clears seen_pipelines (retaining capacity) so the next list records again.
+        let cap = state.seen_pipelines.capacity();
+        state.reset(std::ptr::null());
+        assert_eq!(state.seen_pipelines.capacity(), cap);
+        recorded.clear();
+
+        state.note_pipeline(0x1000, || {
+            calls += 1;
+            recorded.insert(Arc::clone(&name_a));
+        });
+        assert_eq!(calls, 3);
+        assert!(recorded.contains(name_a.as_ref()));
     }
 }
