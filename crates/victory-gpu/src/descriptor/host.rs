@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::{VIEW_TAG, View, view_at};
+use super::{VIEW_TAG, View, view_at, with_views};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
@@ -663,31 +663,59 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
-            self.set_stride(index, Some(&view));
-            self.note_address(index, Some(&view));
-            // Shaders index the heap itself (`crate::bindless`): buffer views
-            // are made when written.
-            // shortcut: views of textures the title placed itself are made
-            // when a draw reads them through a table: a host texture (and a
-            // staging copy) for each of the ~20,000 the title has views of
-            // ran the host out of memory (run b2).
-            let later = !for_draw && is_placed_texture(&view);
-            made[index as usize] = if later { 0 } else { key };
-            let (kept, mark) = if later {
-                (None, None)
-            } else {
-                make_marked(&view, self.cpu(index))
-            };
-            self.set_mark(index, mark);
-            if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
-            }
-            if !self.sampler {
-                self.viewed.set(index, Some(&view), kept.is_some());
-            }
-            self.keep(index, kept.flatten());
+            self.apply_view(&mut made, index, key, &view, for_draw);
         }
         Some(view)
+    }
+
+    fn apply_view(&self, made: &mut [u64], index: u32, key: u64, view: &View, for_draw: bool) {
+        self.set_stride(index, Some(view));
+        self.note_address(index, Some(view));
+        // Shaders index the heap itself (`crate::bindless`): buffer views
+        // are made when written.
+        // shortcut: views of textures the title placed itself are made
+        // when a draw reads them through a table: a host texture (and a
+        // staging copy) for each of the ~20,000 the title has views of
+        // ran the host out of memory (run b2).
+        let later = !for_draw && is_placed_texture(view);
+        made[index as usize] = if later { 0 } else { key };
+        let (kept, mark) = if later {
+            (None, None)
+        } else {
+            make_marked(view, self.cpu(index))
+        };
+        self.set_mark(index, mark);
+        if kept.is_none() && !self.sampler {
+            null_for(view, self.cpu(index));
+        }
+        if !self.sampler {
+            self.viewed.set(index, Some(view), kept.is_some());
+        }
+        self.keep(index, kept.flatten());
+    }
+
+    /// Makes host slots `first..last` from `start + index * step` (`for_draw =
+    /// false`), locking `self.made` once and `VIEWS` at most once for the range
+    /// and releasing `VIEWS` before any D3D12 view creation or nulling.
+    pub(crate) fn mirror_range(&self, first: u32, last: u32, start: u64, step: u64) {
+        let end = last.min(self.count);
+        if first >= end {
+            return;
+        }
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `sync_heaps` checks that the dirty page covering `first..end`
+        // is readable, and `end <= self.count == made.len()`.
+        let updates = unsafe { classify_range(&made, first, end, start, step) };
+        for (index, key, view) in updates {
+            match view {
+                Some(view) => self.apply_view(&mut made, index, key, &view, false),
+                None => {
+                    made[index as usize] = 0;
+                    self.make_null(index);
+                    self.note_address(index, None);
+                }
+            }
+        }
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -716,6 +744,49 @@ impl HostHeap {
     pub(crate) fn made(&self, index: u32) -> bool {
         self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
     }
+}
+
+/// Scans slots `first..end` against `made`, returning `(index, key, Option<View>)`
+/// only for changed or newly-stale slots. Acquires `VIEWS` at most once, skips
+/// empty unchanged slots without consulting `VIEWS`, and checks unchanged
+/// populated slots by generation only (no `View::clone()`).
+///
+/// # Safety
+/// Every `start + u64::from(index) * step` in `first..end` must be readable for
+/// at least 12 bytes (`[u32; 3]`).
+pub(super) unsafe fn classify_range(made: &[u64], first: u32, end: u32, start: u64, step: u64) -> Vec<(u32, u64, Option<View>)> {
+    assert!(end as usize <= made.len());
+    let read = |index: u32| -> [u32; 3] {
+        // SAFETY: caller guarantees every slot in `first..end` is readable.
+        unsafe { ((start + u64::from(index) * step) as *const [u32; 3]).read_unaligned() }
+    };
+    let (mut updates, mut index) = (Vec::new(), first);
+    while index < end && read(index)[0] != VIEW_TAG {
+        if made[index as usize] != 0 {
+            updates.push((index, 0, None));
+        }
+        index += 1;
+    }
+    if index < end {
+        with_views(|views| {
+            for index in index..end {
+                let ([tag, i, generation], prev) = (read(index), made[index as usize]);
+                if tag != VIEW_TAG {
+                    if prev != 0 { updates.push((index, 0, None)); }
+                    continue;
+                }
+                let key = u64::from(generation) << 32 | u64::from(i);
+                if prev == key {
+                    if prev != 0 && !views.matches(i, generation) { updates.push((index, 0, None)); }
+                } else if let Some(view) = views.get(i, generation) {
+                    updates.push((index, key, Some(view.clone())));
+                } else if prev != 0 {
+                    updates.push((index, 0, None));
+                }
+            }
+        });
+    }
+    updates
 }
 
 /// Logs `what` the first time it happens.
@@ -1562,5 +1633,73 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    /// Batch classification across empty, unchanged, updated, placed-texture,
+    /// and `forget()`-stale slots matches per-slot `mirror(..., false)` and
+    /// emits zero updates for unchanged populated slots on repeat sync.
+    #[test]
+    fn classify_range_matches_per_slot_mirror_across_pages() {
+        use super::super::{copy_simple, create_cbv, create_placed_srv, create_srv, create_uav, forget};
+        let (per_page, null, no_desc) = ((crate::watch::PAGE / 32) as u32, std::ptr::null(), std::ptr::null());
+        let (total, mut buf) = (per_page * 3, vec![0u8; per_page as usize * 3 * 32]);
+        let (start, p2) = (buf.as_mut_ptr() as u64, per_page * 2);
+        let slot = |i: u32| start + u64::from(i) * 32;
+        let (res_a, res_b, res_c, res_d) = (0x5555_1000usize, 0x5555_2000, 0x5555_3000, 0x5555_4000);
+        create_cbv(null, &[0x4000, 0, 512, 0], slot(1));
+        create_srv(null, res_a as crate::object::This, no_desc, slot(2));
+        create_srv(null, res_b as crate::object::This, no_desc, slot(3));
+        create_uav(null, res_c as crate::object::This, null, no_desc, slot(4));
+        create_placed_srv(null, &[3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], &[0u32; 16], slot(5));
+        let write_raw = |i: u32, w: [u32; 3]| {
+            // SAFETY: callers only pass indices `< total` inside `buf`.
+            unsafe { (slot(i) as *mut [u32; 3]).write_unaligned(w) };
+        };
+        for (i, w) in [(6, [VIEW_TAG, 0, 0]), (7, [VIEW_TAG, u32::MAX, 1]), (8, [0xdead_beef, 1, 1])] {
+            write_raw(i, w);
+        }
+        copy_simple(null, 2, slot(p2 + 1), slot(1), 0);
+        create_srv(null, res_d as crate::object::This, no_desc, slot(p2 + 4));
+        let sync_all = |batch: &mut [u64], reference: &mut [u64]| -> usize {
+            (0..3).map(|p| {
+                let (first, end) = (p * per_page, (p + 1) * per_page);
+                // SAFETY: `first..end` lies inside `buf` and `end <= total`.
+                let got = unsafe { classify_range(batch, first, end, start, 32) };
+                for &(idx, key, ref view) in &got {
+                    batch[idx as usize] = view.as_ref().filter(|v| !is_placed_texture(v)).map_or(0, |_| key);
+                }
+                let mut expected = Vec::new();
+                for idx in first..end {
+                    // SAFETY: `idx` lies inside `buf`.
+                    let [tag, i, g] = unsafe { (slot(idx) as *const [u32; 3]).read_unaligned() };
+                    let key = u64::from(g) << 32 | u64::from(i);
+                    match (tag == VIEW_TAG).then(|| view_at(i, g)).flatten() {
+                        None if reference[idx as usize] != 0 => { reference[idx as usize] = 0; expected.push((idx, 0, None)); }
+                        Some(v) if reference[idx as usize] != key => {
+                            reference[idx as usize] = if is_placed_texture(&v) { 0 } else { key };
+                            expected.push((idx, key, Some(v)));
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!((&got, &batch[first as usize..end as usize]), (&expected, &reference[first as usize..end as usize]));
+                got.len()
+            }).sum()
+        };
+        let (mut batch, mut reference) = (vec![0u64; total as usize], vec![0u64; total as usize]);
+        assert_eq!(sync_all(&mut batch, &mut reference), 8);
+        // SAFETY: `slot(5)` lies inside `buf`; simulate a draw realizing the placed texture.
+        let [_, i5, g5] = unsafe { (slot(5) as *const [u32; 3]).read_unaligned() };
+        (batch[5], reference[5]) = (u64::from(g5) << 32 | u64::from(i5), u64::from(g5) << 32 | u64::from(i5));
+        assert_eq!(sync_all(&mut batch, &mut reference), 0);
+        create_cbv(null, &[0x8000, 0, 128, 0], slot(3));
+        write_raw(p2 + 1, [0, 0, 0]);
+        for r in [res_a, res_d] { forget(r); }
+        create_srv(null, res_d as crate::object::This, no_desc, slot(p2 + 5));
+        assert_eq!(sync_all(&mut batch, &mut reference), 6);
+        assert_eq!((batch[2], batch[(p2 + 1) as usize], batch[(p2 + 2) as usize], batch[(p2 + 4) as usize]), (0, 0, 0, 0));
+        assert_ne!(batch[(p2 + 5) as usize], 0);
+        assert_eq!(sync_all(&mut batch, &mut reference), 0);
+        for r in [res_b, res_c, res_d] { forget(r); }
     }
 }
