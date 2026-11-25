@@ -4276,10 +4276,7 @@ impl<'a> Lower<'a> {
             (lo, hi) = self.add64(lo, hi, x, negative);
         }
         let (h, off) = self.memory(lo, hi, 4 * count, false, None);
-        for k in 0..count {
-            let four = self.s.m.i32(4 * k);
-            let at = self.s.m.bin(self.cur, Bin::Add, off, four);
-            let x = self.raw_dword(h, at);
+        for (k, x) in self.raw_dwords(h, off, count).into_iter().enumerate() {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -4316,6 +4313,39 @@ impl<'a> Lower<'a> {
         );
         let x = self.s.m.extract(c, r, 0);
         self.as_int(x)
+    }
+
+    /// `count` consecutive dwords from byte `off` of raw buffer `h`, loaded in
+    /// chunks of up to four.
+    fn raw_dwords(&mut self, h: V, off: V, count: u32) -> Vec<V> {
+        let c = self.cur;
+        let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let mut out = Vec::with_capacity(count as usize);
+        let mut base = 0;
+        while base < count {
+            let m = (count - base).min(4);
+            let at = if base == 0 {
+                off
+            } else {
+                let d = self.s.m.i32(4 * base);
+                self.s.m.bin(c, Bin::Add, off, d)
+            };
+            let mask = self.s.m.i8((1u8 << m) - 1);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, at, u, mask, al],
+            );
+            for k in 0..m {
+                let x = self.s.m.extract(c, r, k);
+                out.push(self.as_int(x));
+            }
+            base += m;
+        }
+        out
     }
 
     /// Marks the pages a write of `bytes` bytes at byte `x` of the unordered
@@ -4538,15 +4568,48 @@ impl<'a> Lower<'a> {
             return Err("a descriptor read only as data");
         }
         let views = self.s.view_addresses_handle();
-        for k in 0..count {
+        let mut k = 0;
+        while k < count {
             let word = (a.offset / 4 + k) % 8;
-            let val = if word < 2 {
+            if word == 0 && k + 1 < count {
+                // Dwords 0 and 1 of the same descriptor are one 8-byte-aligned
+                // pair in `VIEW_ADDRESSES`.
                 let index = self.heap_index(site, k as u8, false)?;
                 let c = self.cur;
                 let three = self.s.m.i32(3);
                 let at = self.s.m.bin(c, Bin::Shl, index, three);
-                let w = self.s.m.i32(4 * word);
-                let at = self.s.m.bin(c, Bin::Add, at, w);
+                let (u, mask, al) = (
+                    self.s.m.undef(self.s.t.i32),
+                    self.s.m.i8(3),
+                    self.s.m.i32(8),
+                );
+                let r = self.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[views, at, u, mask, al],
+                );
+                for j in 0..2 {
+                    let x = self.s.m.extract(c, r, j);
+                    let val = Val::I32(self.as_int(x));
+                    if let Some(v) = inst.write(Reg::S(code + (k + j) as u8)) {
+                        self.vals.insert(v, val);
+                    }
+                }
+                k += 2;
+                continue;
+            }
+            let val = if word < 2 {
+                let index = self.heap_index(site, k as u8, false)?;
+                let c = self.cur;
+                let three = self.s.m.i32(3);
+                let mut at = self.s.m.bin(c, Bin::Shl, index, three);
+                if word != 0 {
+                    let w = self.s.m.i32(4 * word);
+                    at = self.s.m.bin(c, Bin::Add, at, w);
+                }
                 Val::I32(self.raw_dword(views, at))
             } else {
                 Val::Missing(OTHER)
@@ -4554,6 +4617,7 @@ impl<'a> Lower<'a> {
             if let Some(v) = inst.write(Reg::S(code + k as u8)) {
                 self.vals.insert(v, val);
             }
+            k += 1;
         }
         Ok(())
     }
@@ -4628,41 +4692,28 @@ impl<'a> Lower<'a> {
     // converted values exactly.
     fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
+        let used_bits = &bits[..bits.len().min(channels as usize)];
+        let need_bits: u32 = used_bits.iter().sum();
+        if need_bits == 0 {
+            return Ok(Vec::new());
+        }
         let c = self.cur;
         let total: u32 = bits.iter().sum();
-        let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-        let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
-            let mask = l.s.m.i8((1u8 << n) - 1);
-            let r = l.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                l.s.t.res_ret,
-                139,
-                &[h, at, u, mask, align],
-            );
-            (0..n)
-                .map(|k| {
-                    let x = l.s.m.extract(c, r, k);
-                    l.as_int(x)
-                })
-                .collect()
-        };
         let words = if total < 32 {
             // A byte or half inside the dword that holds it.
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let at = self.s.m.bin(c, Bin::And, off, not3);
-            let w = load(self, at, 1)[0];
+            let w = self.raw_dword(h, at);
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             vec![self.s.m.bin(c, Bin::LShr, w, sh)]
         } else {
-            load(self, off, total / 32)
+            self.raw_dwords(h, off, need_bits.div_ceil(32))
         };
         let float = |l: &mut Self, f: V| l.as_int(f);
         let mut out = Vec::new();
         let mut at = 0;
-        for &w in bits {
+        for &w in used_bits {
             let word = words[(at / 32) as usize];
             let field = if w == 32 {
                 word
@@ -4748,7 +4799,6 @@ impl<'a> Lower<'a> {
         for k in out.len() as u32..channels {
             out.push(self.s.m.i32(if k == 3 { one } else { 0 }));
         }
-        out.truncate(channels as usize);
         Ok(out)
     }
 
@@ -8804,14 +8854,7 @@ impl<'a> Lower<'a> {
                     return Err("a buffer result");
                 };
                 let (h, byte) = self.raw_view(site, src, byte, 4 * count, (11, 0), false, guard)?;
-                for k in 0..count {
-                    let four = self.s.m.i32(4 * k);
-                    let a = self.s.m.bin(c, Bin::Add, byte, four);
-                    let (mask, al) = (self.s.m.i8(1), self.s.m.i32(4));
-                    let u = self.s.m.undef(self.s.t.i32);
-                    let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, a, u, mask, al]);
-                    let x = self.s.m.extract(c, r, 0);
-                    let x = self.as_int(x);
+                for (k, x) in self.raw_dwords(h, byte, count).into_iter().enumerate() {
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
                 }
                 return Ok(());
@@ -11251,6 +11294,794 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+    }
+
+    mod format_smem_vec_tests {
+        use super::*;
+
+    /// Summary of emitted DXIL instructions decoded directly from the module's
+    /// LLVM 3.7 bitcode (unabbreviated records, as `bitcode.rs` writes them).
+    #[derive(Debug, Default)]
+    struct DxilStats {
+        /// `(mask, align)` for each `dx.op.rawBufferLoad.f32` call in order.
+        raw_loads: Vec<(u8, u32)>,
+        /// Count of `dx.op.legacyF16ToF32` calls.
+        legacy_f16_to_f32: usize,
+        /// Count of floating-point divisions (`fdiv`).
+        fdivs: usize,
+        /// Count of `uitofp` / `sitofp` casts.
+        int_to_fp: usize,
+    }
+
+    fn inspect_dxil(dxil: &[u8]) -> DxilStats {
+        use std::collections::HashMap;
+        use super::super::super::bitcode::{Bin, Cast};
+
+        let container = crate::Container::parse(dxil).expect("parse DXBC container");
+        let part = container.part(crate::FourCC::DXIL).expect("DXIL part");
+        let prog = crate::dxil::DxilProgram::parse(part.data).expect("parse DXIL program");
+        let bc = prog.bitcode;
+        assert_eq!(&bc[..4], b"BC\xC0\xDE");
+
+        struct Reader {
+            words: Vec<u32>,
+            word: usize,
+            bit: u32,
+        }
+        impl Reader {
+            fn read(&mut self, mut width: u32) -> u64 {
+                let mut out = 0u64;
+                let mut shift = 0u32;
+                while width > 0 {
+                    let avail = 32 - self.bit;
+                    let take = width.min(avail);
+                    let mask = if take == 32 {
+                        u32::MAX
+                    } else {
+                        (1u32 << take) - 1
+                    };
+                    let chunk = (self.words[self.word] >> self.bit) & mask;
+                    out |= u64::from(chunk) << shift;
+                    self.bit += take;
+                    if self.bit == 32 {
+                        self.word += 1;
+                        self.bit = 0;
+                    }
+                    shift += take;
+                    width -= take;
+                }
+                out
+            }
+            fn vbr(&mut self, width: u32) -> u64 {
+                let hi = 1u64 << (width - 1);
+                let mut out = 0u64;
+                let mut shift = 0u32;
+                loop {
+                    let chunk = self.read(width);
+                    out |= (chunk & (hi - 1)) << shift;
+                    if chunk & hi == 0 {
+                        return out;
+                    }
+                    shift += width - 1;
+                }
+            }
+            fn align32(&mut self) {
+                if self.bit != 0 {
+                    self.word += 1;
+                    self.bit = 0;
+                }
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum TyInfo {
+            Void,
+            Float,
+            Other,
+            Func(u32),
+        }
+
+        let words: Vec<u32> = bc
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
+            .collect();
+        let mut r = Reader {
+            words,
+            word: 1,
+            bit: 0,
+        };
+        let mut stack: Vec<(u64, u32)> = Vec::new();
+        let mut types: Vec<TyInfo> = Vec::new();
+        let mut globals = 0u32;
+        let mut funcs = 0u32;
+        let mut cur_const_ty = 0usize;
+        let mut const_ints: Vec<Option<i64>> = Vec::new();
+        let mut const_is_float: Vec<bool> = Vec::new();
+        let mut symtab: HashMap<u32, String> = HashMap::new();
+        let mut val_is_float: Vec<bool> = Vec::new();
+        let mut inst_id = 0u32;
+        let mut stats = DxilStats::default();
+
+        while r.word < r.words.len() {
+            let abbrev_w = stack.last().map_or(2, |b| b.1);
+            let abbrev = r.read(abbrev_w);
+            match abbrev {
+                0 => {
+                    r.align32();
+                    if stack.pop().is_none() {
+                        break;
+                    }
+                }
+                1 => {
+                    let id = r.vbr(8);
+                    let w = r.vbr(4) as u32;
+                    r.align32();
+                    let _len = r.read(32);
+                    if id == 12 {
+                        // FUNCTION_BLOCK: value IDs are globals, funcs, constants, instructions.
+                        let first_const = (globals + funcs) as usize;
+                        val_is_float.clear();
+                        val_is_float.resize(first_const, false);
+                        val_is_float.extend_from_slice(&const_is_float);
+                        inst_id = val_is_float.len() as u32;
+                    }
+                    stack.push((id, w));
+                }
+                3 => {
+                    let code = r.vbr(6);
+                    let n = r.vbr(6) as usize;
+                    let ops: Vec<u64> = (0..n).map(|_| r.vbr(6)).collect();
+                    let block = stack.last().map_or(0, |b| b.0);
+                    match block {
+                        8 => match code {
+                            7 => globals += 1,
+                            8 => funcs += 1,
+                            _ => {}
+                        },
+                        17 => match code {
+                            2 => types.push(TyInfo::Void),
+                            3 => types.push(TyInfo::Float),
+                            7 | 8 | 11 | 18 | 20 => types.push(TyInfo::Other),
+                            21 => types.push(TyInfo::Func(ops[1] as u32)),
+                            _ => {}
+                        },
+                        11 => match code {
+                            1 => cur_const_ty = ops[0] as usize,
+                            3 => {
+                                const_ints.push(None);
+                                const_is_float.push(matches!(types[cur_const_ty], TyInfo::Float));
+                            }
+                            4 => {
+                                let raw = ops[0];
+                                let v = if raw & 1 != 0 {
+                                    -((raw >> 1) as i64)
+                                } else {
+                                    (raw >> 1) as i64
+                                };
+                                const_ints.push(Some(v));
+                                const_is_float.push(false);
+                            }
+                            6 => {
+                                const_ints.push(None);
+                                const_is_float.push(true);
+                            }
+                            7 => {
+                                const_ints.push(None);
+                                const_is_float.push(false);
+                            }
+                            _ => {}
+                        },
+                        14 if code == 1 => {
+                            let bytes: Vec<u8> = ops[1..].iter().map(|&x| x as u8).collect();
+                            symtab.insert(ops[0] as u32, String::from_utf8(bytes).unwrap());
+                        }
+                        12 => match code {
+                            1 | 10 | 11 | 44 => {}
+                            2 => {
+                                let lhs = (inst_id - ops[0] as u32) as usize;
+                                let is_f = val_is_float[lhs];
+                                if ops[2] == Bin::SDiv as u64 && is_f {
+                                    stats.fdivs += 1;
+                                }
+                                val_is_float.push(is_f);
+                                inst_id += 1;
+                            }
+                            3 => {
+                                if ops[2] == Cast::UiToFp as u64 || ops[2] == Cast::SiToFp as u64 {
+                                    stats.int_to_fp += 1;
+                                }
+                                val_is_float
+                                    .push(matches!(types[ops[1] as usize], TyInfo::Float));
+                                inst_id += 1;
+                            }
+                            16 => {
+                                val_is_float
+                                    .push(matches!(types[ops[0] as usize], TyInfo::Float));
+                                inst_id += 1;
+                            }
+                            20 => {
+                                val_is_float
+                                    .push(matches!(types[ops[1] as usize], TyInfo::Float));
+                                inst_id += 1;
+                            }
+                            26 | 28 | 38 | 43 | 46 => {
+                                val_is_float.push(false);
+                                inst_id += 1;
+                            }
+                            29 => {
+                                let t_id = (inst_id - ops[0] as u32) as usize;
+                                val_is_float.push(val_is_float[t_id]);
+                                inst_id += 1;
+                            }
+                            34 => {
+                                let fn_id = inst_id - ops[3] as u32;
+                                let name = symtab.get(&fn_id).map(String::as_str).unwrap_or("");
+                                if name == "dx.op.rawBufferLoad.f32" {
+                                    let first_const = globals + funcs;
+                                    let mask_id = inst_id - ops[8] as u32;
+                                    let align_id = inst_id - ops[9] as u32;
+                                    let mask = const_ints[(mask_id - first_const) as usize]
+                                        .expect("constant rawBufferLoad mask")
+                                        as u8;
+                                    let align = const_ints[(align_id - first_const) as usize]
+                                        .expect("constant rawBufferLoad align")
+                                        as u32;
+                                    stats.raw_loads.push((mask, align));
+                                } else if name == "dx.op.legacyF16ToF32" {
+                                    stats.legacy_f16_to_f32 += 1;
+                                }
+                                if let TyInfo::Func(ret) = types[ops[2] as usize]
+                                    && !matches!(types[ret as usize], TyInfo::Void)
+                                {
+                                    val_is_float
+                                        .push(matches!(types[ret as usize], TyInfo::Float));
+                                    inst_id += 1;
+                                }
+                            }
+                            other => panic!("unexpected FUNCTION_BLOCK record {other}"),
+                        },
+                        _ => {}
+                    }
+                }
+                other => panic!("unexpected bitcode abbrev {other}"),
+            }
+        }
+        stats
+    }
+
+    fn validate_dxil(dxil: &[u8]) {
+        #[cfg(windows)]
+        {
+            let explicit = std::env::var_os("VICTORY_DXIL").is_some();
+            match super::super::super::validator::Validator::load(
+                super::super::super::validator::Validator::default_path().as_deref(),
+            ) {
+                Ok(mut v) => v
+                    .validate(&mut dxil.to_vec())
+                    .expect("DXIL validation failed"),
+                Err(e) if explicit => panic!("VICTORY_DXIL set but failed to load: {e}"),
+                Err(_) => {}
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = dxil;
+    }
+
+    const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
+        0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32
+    }
+
+    const fn s_xor_b32(sdst: u8, src0: u8, src1: u8) -> u32 {
+        0x8000_0000 | (0x12 << 23) | (sdst as u32) << 16 | (src1 as u32) << 8 | src0 as u32
+    }
+
+    const fn v_mov_b32(vdst: u8, src0: u16) -> u32 {
+        0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | (src0 as u32 & 0x1FF)
+    }
+
+    const fn s_load(op: u32, sdata: u8, sbase: u8, offset: u32) -> [u32; 2] {
+        [
+            0x3D << 26 | op << 18 | (sdata as u32) << 6 | (sbase as u32 >> 1),
+            125 << 25 | (offset & 0x1F_FFFF),
+        ]
+    }
+
+    const fn mtbuf_load(op: u8, vdata: u8, srsrc: u8, format: u8) -> [u32; 2] {
+        [
+            0x3A << 26 | (format as u32 & 0x7F) << 19 | (op as u32 & 7) << 16,
+            0x80 << 24
+                | (op as u32 >> 3 & 1) << 21
+                | (srsrc as u32 >> 2 & 0x1F) << 16
+                | (vdata as u32) << 8,
+        ]
+    }
+
+    const fn mubuf_load(op: u8, vdata: u8, vaddr: u8, srsrc: u8, idxen: bool) -> [u32; 2] {
+        [
+            0x38 << 26 | (op as u32) << 18 | (idxen as u32) << 13,
+            0x80 << 24
+                | (srsrc as u32 >> 2 & 0x1F) << 16
+                | (vdata as u32) << 8
+                | vaddr as u32,
+        ]
+    }
+
+    const fn mubuf_store(op: u8, vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+        [
+            0x38 << 26 | (op as u32) << 18 | (byte_off as u32 & 0xFFF),
+            0x80 << 24 | (srsrc as u32 >> 2 & 0x1F) << 16 | (vdata as u32) << 8,
+        ]
+    }
+
+    /// Lowers a one-thread wave32 compute shader with no LDS (`rsrc2` leaves
+    /// `lds_dwords == 0`, so no fixed `WaveSize` is declared and WARP runs it).
+    fn lower_cs_no_lds(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+    ) -> Result<Lowered, crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout,
+            used,
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: sgprs.max(2) << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            view_marks: false,
+        })
+    }
+
+    /// Lowers a compute shader that performs one `tbuffer_load_format_*` from
+    /// heap slot 0 (raw SRV) and stores its live result dwords to heap slot 1
+    /// (raw UAV).
+    fn lower_tbuffer_format(op: u8, format: u8, store_dwords: u32) -> Lowered {
+        let store_op = match store_dwords {
+            1 => 0x1c,
+            2 => 0x1d,
+            3 => 0x1f,
+            4 => 0x1e,
+            _ => unreachable!(),
+        };
+        let mut words = vec![s_mov_b32(1, 0x80)]; // s[0:1] = table base
+        words.extend(s_load(2, 8, 0, 0x00)); // s[8:11] = SRV (slot 0)
+        words.extend(s_load(2, 12, 0, 0x20)); // s[12:15] = UAV (slot 1)
+        words.extend(mtbuf_load(op, 4, 8, format));
+        words.extend(mubuf_store(store_op, 4, 12, 0));
+        words.push(S_ENDPGM);
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ];
+        let l = lower_cs_no_lds(&words, layout, used).expect("lower tbuffer format");
+        validate_dxil(&l.dxil);
+        l
+    }
+
+    #[test]
+    fn format_load_skips_dead_channels_and_loads() {
+        // 8_8_8_8_UNORM (format 56): fewer channels emit fewer fdiv + uitofp.
+        let u8_x = inspect_dxil(&lower_tbuffer_format(0, 56, 1).dxil);
+        let u8_xy = inspect_dxil(&lower_tbuffer_format(1, 56, 2).dxil);
+        let u8_xyzw = inspect_dxil(&lower_tbuffer_format(3, 56, 4).dxil);
+        assert_eq!(u8_x.raw_loads, [(1, 4)]);
+        assert_eq!(u8_xy.raw_loads, [(1, 4)]);
+        assert_eq!(u8_xyzw.raw_loads, [(1, 4)]);
+        assert_eq!((u8_x.fdivs, u8_xy.fdivs, u8_xyzw.fdivs), (1, 2, 4));
+        assert_eq!(
+            (u8_x.int_to_fp, u8_xy.int_to_fp, u8_xyzw.int_to_fp),
+            (1, 2, 4)
+        );
+
+        // 16_16_16_16_FLOAT (format 71): _x/_xy load 1 dword (mask=1) instead
+        // of 2 (mask=3), and emit 1 or 2 legacyF16ToF32 instead of 4.
+        let f16_x = inspect_dxil(&lower_tbuffer_format(0, 71, 1).dxil);
+        let f16_xy = inspect_dxil(&lower_tbuffer_format(1, 71, 2).dxil);
+        let f16_xyz = inspect_dxil(&lower_tbuffer_format(2, 71, 3).dxil);
+        let f16_xyzw = inspect_dxil(&lower_tbuffer_format(3, 71, 4).dxil);
+        assert_eq!(f16_x.raw_loads, [(1, 4)]);
+        assert_eq!(f16_xy.raw_loads, [(1, 4)]);
+        assert_eq!(f16_xyz.raw_loads, [(3, 4)]);
+        assert_eq!(f16_xyzw.raw_loads, [(3, 4)]);
+        assert_eq!(
+            (
+                f16_x.legacy_f16_to_f32,
+                f16_xy.legacy_f16_to_f32,
+                f16_xyz.legacy_f16_to_f32,
+                f16_xyzw.legacy_f16_to_f32,
+            ),
+            (1, 2, 3, 4)
+        );
+
+        // d16 on 16_16_16_16_FLOAT: still skips dead channels & dwords.
+        let d16_x = inspect_dxil(&lower_tbuffer_format(8, 71, 1).dxil);
+        let d16_xy = inspect_dxil(&lower_tbuffer_format(9, 71, 1).dxil);
+        assert_eq!(d16_x.raw_loads, [(1, 4)]);
+        assert_eq!(d16_xy.raw_loads, [(1, 4)]);
+        assert_eq!((d16_x.legacy_f16_to_f32, d16_xy.legacy_f16_to_f32), (1, 2));
+
+        // 32_32_32_32_FLOAT (format 77): mask shrinks to the loaded dwords.
+        let f32_x = inspect_dxil(&lower_tbuffer_format(0, 77, 1).dxil);
+        let f32_xy = inspect_dxil(&lower_tbuffer_format(1, 77, 2).dxil);
+        let f32_xyz = inspect_dxil(&lower_tbuffer_format(2, 77, 3).dxil);
+        let f32_xyzw = inspect_dxil(&lower_tbuffer_format(3, 77, 4).dxil);
+        assert_eq!(f32_x.raw_loads, [(1, 4)]);
+        assert_eq!(f32_xy.raw_loads, [(3, 4)]);
+        assert_eq!(f32_xyz.raw_loads, [(7, 4)]);
+        assert_eq!(f32_xyzw.raw_loads, [(15, 4)]);
+
+        // Sub-dword 8_8_UNORM (format 14) and 8_UNORM (format 1): still load
+        // 1 dword, skip dead channels, and fill missing channels up to 4.
+        let sub_x = inspect_dxil(&lower_tbuffer_format(0, 14, 1).dxil);
+        let sub_xy = inspect_dxil(&lower_tbuffer_format(1, 14, 2).dxil);
+        let sub_xyzw = inspect_dxil(&lower_tbuffer_format(3, 14, 4).dxil);
+        assert_eq!(sub_x.raw_loads, [(1, 4)]);
+        assert_eq!(sub_xy.raw_loads, [(1, 4)]);
+        assert_eq!(sub_xyzw.raw_loads, [(1, 4)]);
+        assert_eq!((sub_x.fdivs, sub_xy.fdivs, sub_xyzw.fdivs), (1, 2, 2));
+        let u8_1_xyzw = inspect_dxil(&lower_tbuffer_format(3, 1, 4).dxil);
+        assert_eq!(u8_1_xyzw.raw_loads, [(1, 4)]);
+        assert_eq!(u8_1_xyzw.fdivs, 1);
+
+        // Packed 10_10_10_2_UNORM (44), 2_10_10_10_UNORM (50),
+        // 10_11_11_FLOAT (36) & 11_11_10_FLOAT (43).
+        let p2_x = inspect_dxil(&lower_tbuffer_format(0, 44, 1).dxil);
+        let p2_xy = inspect_dxil(&lower_tbuffer_format(1, 44, 2).dxil);
+        let p2_xyzw = inspect_dxil(&lower_tbuffer_format(3, 44, 4).dxil);
+        assert_eq!((p2_x.fdivs, p2_xy.fdivs, p2_xyzw.fdivs), (1, 2, 4));
+        let p10_x = inspect_dxil(&lower_tbuffer_format(0, 50, 1).dxil);
+        let p10_xy = inspect_dxil(&lower_tbuffer_format(1, 50, 2).dxil);
+        let p10_xyzw = inspect_dxil(&lower_tbuffer_format(3, 50, 4).dxil);
+        assert_eq!((p10_x.fdivs, p10_xy.fdivs, p10_xyzw.fdivs), (1, 2, 4));
+        let p10f_x = inspect_dxil(&lower_tbuffer_format(0, 36, 1).dxil);
+        let p10f_xy = inspect_dxil(&lower_tbuffer_format(1, 36, 2).dxil);
+        let p10f_xyz = inspect_dxil(&lower_tbuffer_format(2, 36, 3).dxil);
+        assert_eq!(
+            (
+                p10f_x.legacy_f16_to_f32,
+                p10f_xy.legacy_f16_to_f32,
+                p10f_xyz.legacy_f16_to_f32,
+            ),
+            (1, 2, 3)
+        );
+        let p11_x = inspect_dxil(&lower_tbuffer_format(0, 43, 1).dxil);
+        let p11_xy = inspect_dxil(&lower_tbuffer_format(1, 43, 2).dxil);
+        let p11_xyz = inspect_dxil(&lower_tbuffer_format(2, 43, 3).dxil);
+        assert_eq!(
+            (
+                p11_x.legacy_f16_to_f32,
+                p11_xy.legacy_f16_to_f32,
+                p11_xyz.legacy_f16_to_f32,
+            ),
+            (1, 2, 3)
+        );
+
+        // 16_16_SNORM (24), 32_32_FLOAT (64), 32_32_32_FLOAT (74).
+        let s16_x = inspect_dxil(&lower_tbuffer_format(0, 24, 1).dxil);
+        let s16_xy = inspect_dxil(&lower_tbuffer_format(1, 24, 2).dxil);
+        assert_eq!((s16_x.fdivs, s16_xy.fdivs), (1, 2));
+        assert_eq!((s16_x.int_to_fp, s16_xy.int_to_fp), (1, 2));
+        assert_eq!(inspect_dxil(&lower_tbuffer_format(0, 64, 1).dxil).raw_loads, [(1, 4)]);
+        assert_eq!(inspect_dxil(&lower_tbuffer_format(1, 64, 2).dxil).raw_loads, [(3, 4)]);
+        assert_eq!(inspect_dxil(&lower_tbuffer_format(0, 74, 1).dxil).raw_loads, [(1, 4)]);
+        assert_eq!(inspect_dxil(&lower_tbuffer_format(1, 74, 2).dxil).raw_loads, [(3, 4)]);
+        assert_eq!(inspect_dxil(&lower_tbuffer_format(2, 74, 3).dxil).raw_loads, [(7, 4)]);
+    }
+
+    fn lower_table_cbv_load(load_op: u8, store_op: u8) -> Lowered {
+        let mut words = vec![s_mov_b32(1, 0x80)]; // s[0:1] = table base
+        words.extend(s_load(2, 8, 0, 0x00)); // s[8:11] = table CBV (slot 0)
+        words.extend(s_load(2, 12, 0, 0x20)); // s[12:15] = table UAV (slot 1)
+        words.extend(mubuf_load(load_op, 4, 0, 8, true)); // indexed by v0
+        words.extend(mubuf_store(store_op, 4, 12, 0));
+        words.push(S_ENDPGM);
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Cbv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ];
+        let l = lower_cs_no_lds(&words, layout, used).expect("lower table CBV");
+        validate_dxil(&l.dxil);
+        l
+    }
+
+    #[test]
+    fn table_cbv_buffer_load_vectorizes_to_single_raw_load() {
+        for (load_op, store_op, want_mask) in [
+            (0x0c, 0x1c, 1u8),  // buffer_load_dword
+            (0x0d, 0x1d, 3u8),  // buffer_load_dwordx2
+            (0x0f, 0x1f, 7u8),  // buffer_load_dwordx3
+            (0x0e, 0x1e, 15u8), // buffer_load_dwordx4
+        ] {
+            let l = lower_table_cbv_load(load_op, store_op);
+            let stats = inspect_dxil(&l.dxil);
+            assert_eq!(
+                stats.raw_loads,
+                [(want_mask, 4)],
+                "table-CBV load op {load_op:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_smem_vectorizes_loads_into_four_dword_chunks() {
+        for (op, count, offset, want_data_loads) in [
+            (0u32, 1u32, 0u32, &[(1u8, 4u32)][..]),
+            (1, 2, 0, &[(3, 4)]),
+            (2, 4, 4, &[(15, 4)]),
+            (3, 8, 0, &[(15, 4), (15, 4)]),
+            (4, 16, 0, &[(15, 4), (15, 4), (15, 4), (15, 4)]),
+        ] {
+            let mut words = vec![s_mov_b32(3, 0x80)]; // s[2:3] = table base
+            words.extend(s_load(2, 8, 2, 0x00)); // s[8:11] = UAV
+            words.extend(s_load(op, 16, 0, offset)); // title memory load from s[0:1] + offset
+            // XOR all loaded dwords into s32 so every loaded SGPR is live.
+            words.push(s_mov_b32(32, 16));
+            for k in 1..count {
+                words.push(s_xor_b32(32, 32, 16 + k as u8));
+            }
+            words.push(v_mov_b32(4, 32));
+            words.extend(mubuf_store(0x1c, 4, 8, 0));
+            words.push(S_ENDPGM);
+            let layout = vec![
+                RootParam {
+                    sgprs: 2,
+                    ..root(RootType::Constants, 0, 0)
+                },
+                root(RootType::Table, 2, 1),
+            ];
+            let used = vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 2,
+                slot: 1,
+            }];
+            let l = lower_with(&words, layout, used).expect("lower memory_smem");
+            assert!(l.memory);
+            validate_dxil(&l.dxil);
+            let stats = inspect_dxil(&l.dxil);
+            // `memory_entry` emits 4 single-dword page-table loads first; the
+            // remaining loads are the vectorized `memory_smem` data fetches.
+            assert_eq!(
+                &stats.raw_loads[..4],
+                &[(1, 4), (1, 4), (1, 4), (1, 4)],
+                "memory_smem x{count} page-table loads"
+            );
+            assert_eq!(
+                &stats.raw_loads[4..],
+                want_data_loads,
+                "memory_smem x{count} data loads"
+            );
+        }
+    }
+
+    #[test]
+    fn view_addresses_coalesces_consecutive_address_pairs() {
+        let run = |load: [u32; 2], read_sgprs: &[u8]| -> DxilStats {
+            let mut words = vec![s_mov_b32(1, 0x80)]; // s[0:1] = table base
+            words.extend(s_load(2, 8, 0, 0x00)); // s[8:11] = UAV (slot 0)
+            words.extend(load);
+            words.push(s_mov_b32(32, read_sgprs[0]));
+            for &s in &read_sgprs[1..] {
+                words.push(s_xor_b32(32, 32, s));
+            }
+            words.push(v_mov_b32(4, 32));
+            words.extend(mubuf_store(0x1c, 4, 8, 0));
+            words.push(S_ENDPGM);
+            let layout = vec![root(RootType::Table, 0, 0)];
+            let used = vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }];
+            let l = lower_with(&words, layout, used).expect("lower view_addresses");
+            assert!(l.view_addresses);
+            validate_dxil(&l.dxil);
+            inspect_dxil(&l.dxil)
+        };
+
+        // s_load_dwordx2 at slot 1 (dwords 0-1): coalesced into one (mask=3, align=8).
+        let x2 = run(s_load(1, 16, 0, 0x20), &[16, 17]);
+        assert_eq!(x2.raw_loads, [(3, 8)]);
+
+        // s_load_dwordx4 at slot 1 (dwords 0-3, only 0-1 are addresses): one (mask=3, align=8).
+        let x4 = run(s_load(2, 16, 0, 0x20), &[16, 17]);
+        assert_eq!(x4.raw_loads, [(3, 8)]);
+
+        // s_load_dwordx16 spanning slots 1 and 2 (dwords 0-1 and 8-9): two (mask=3, align=8).
+        let x16 = run(s_load(4, 16, 0, 0x20), &[16, 17, 24, 25]);
+        assert_eq!(x16.raw_loads, [(3, 8), (3, 8)]);
+
+        // Single-dword reads of word 0 or word 1 alone stay 1-dword (mask=1, align=4).
+        let w0 = run(s_load(0, 16, 0, 0x20), &[16]);
+        assert_eq!(w0.raw_loads, [(1, 4)]);
+        let w1 = run(s_load(0, 16, 0, 0x24), &[16]);
+        assert_eq!(w1.raw_loads, [(1, 4)]);
+
+        // Straddling a descriptor boundary (starts at dword 7 of slot 0):
+        // x4 covers word 7 + slot 1's words 0-1 + word 2 -> one (mask=3, align=8).
+        let straddle_x4 = run(s_load(2, 16, 0, 0x1C), &[17, 18]);
+        assert_eq!(straddle_x4.raw_loads, [(3, 8)]);
+        // x2 covers word 7 + slot 1's word 0 only -> stays (mask=1, align=4).
+        let straddle_x2 = run(s_load(1, 16, 0, 0x1C), &[17]);
+        assert_eq!(straddle_x2.raw_loads, [(1, 4)]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn format_load_xy_and_table_cbv_x4_execute_on_gpu() {
+        use super::super::super::HostShader;
+        use super::super::super::host::{Dispatch, Host, Root, Stride, View};
+
+        let to_host = |l: Lowered| HostShader {
+            stage: HwStage::Cs,
+            dxil: l.dxil,
+            user_data: l.user_data,
+            samplers: l.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            memory: l.memory,
+            memory_writes: l.memory_writes,
+            view_addresses: l.view_addresses,
+            heap: l.heap,
+            heap_writes: l.heap_writes,
+            view_marks: l.view_marks,
+        };
+
+        let fmt_u8 = to_host(lower_tbuffer_format(1, 56, 2)); // 8_8_8_8_UNORM xy
+        let fmt_f16 = to_host(lower_tbuffer_format(1, 71, 2)); // 16_16_16_16_FLOAT xy
+        let fmt_f32 = to_host(lower_tbuffer_format(1, 77, 2)); // 32_32_32_32_FLOAT xy
+        let cbv_x4 = to_host(lower_table_cbv_load(0x0e, 0x1e)); // table-CBV dwordx4
+
+        let _one = super::super::super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let run = |shader: &HostShader, input: &[u32], out_dwords: u32| -> Vec<u32> {
+                let (root, pso) = host
+                    .compute_pipeline(shader)
+                    .unwrap_or_else(|e| panic!("{label}: compute_pipeline: {e}"));
+                let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[
+                                View::Buffer {
+                                    data: input,
+                                    stride: Stride::Raw,
+                                },
+                                View::RawUav(out_dwords),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: dispatch: {e}"));
+                out[0].clone()
+            };
+
+            // 8_8_8_8_UNORM xy: low bytes 0x00 and 0xFF -> 0.0 and 1.0.
+            let got = run(&fmt_u8, &[0x1122_FF00], 2);
+            assert_eq!(
+                got,
+                [0.0f32.to_bits(), 1.0f32.to_bits()],
+                "{label}: 8_8_8_8_UNORM xy"
+            );
+
+            // 16_16_16_16_FLOAT xy: low dword holds f16 (1.0, 2.0); high dword
+            // is intentionally garbage (NaN) and must not be needed.
+            let got = run(&fmt_f16, &[0x4000_3C00, 0x7FFF_7FFF], 2);
+            assert_eq!(
+                got,
+                [1.0f32.to_bits(), 2.0f32.to_bits()],
+                "{label}: 16_16_16_16_FLOAT xy"
+            );
+
+            // 32_32_32_32_FLOAT xy: loads first 2 floats only.
+            let got = run(
+                &fmt_f32,
+                &[
+                    1.5f32.to_bits(),
+                    (-3.25f32).to_bits(),
+                    99.0f32.to_bits(),
+                    100.0f32.to_bits(),
+                ],
+                2,
+            );
+            assert_eq!(
+                got,
+                [1.5f32.to_bits(), (-3.25f32).to_bits()],
+                "{label}: 32_32_32_32_FLOAT xy"
+            );
+
+            // Table-CBV buffer_load_dwordx4: all 4 dwords from row 0.
+            let cbv_data = [0xDEAD_BEEF, 0x1234_5678, 0xCAFE_BABE, 0x0BAD_F00D];
+            let got = run(&cbv_x4, &cbv_data, 4);
+            assert_eq!(got, cbv_data, "{label}: table-CBV buffer_load_dwordx4");
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!("no SM 6.6 device available; skipped");
         }
     }
     }
