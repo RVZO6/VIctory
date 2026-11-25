@@ -38,6 +38,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    pub(crate) device10: Option<ID3D12Device10>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -191,6 +192,7 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let device10 = device.cast().ok();
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -239,6 +241,7 @@ fn create() -> windows::core::Result<Host> {
         }
         Ok(Host {
             device,
+            device10,
             queue,
             fence,
             submitted: Mutex::new(0),

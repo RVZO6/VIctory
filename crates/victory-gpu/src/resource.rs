@@ -132,15 +132,13 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
     })
 }
 
-/// A texture's layout in console memory, as the console's layout library
-/// gives it (`victory-hle`'s `xg` serves the same): the description's
-/// layout field is `0x100 | swizzle mode`, 1 linear, 0 the library's pick.
-pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
+/// Translates a D3D12 resource description into a console texture description:
+/// the layout field is `0x100 | swizzle mode`, 1 linear, 0 the library's pick.
+fn texture_desc(desc: &ResourceDesc) -> Option<texture::TextureDesc> {
     use texture::{Dimension, Swizzle, TextureDesc};
     const TEXTURE_1D: u32 = 2;
     const TEXTURE_2D: u32 = 3;
     const RENDER_TARGET: u32 = 1;
-    const DEPTH: u32 = 2;
     let dimension = match desc.dimension {
         TEXTURE_1D => Dimension::Tex1d,
         TEXTURE_2D => Dimension::Tex2d,
@@ -156,7 +154,7 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         l if l & !0xff == 0x100 => Swizzle(l & 0xff),
         _ => return None,
     };
-    texture::Texture::new(&TextureDesc {
+    Some(TextureDesc {
         dimension,
         width: u32::try_from(desc.width).ok()?,
         height: desc.height,
@@ -166,7 +164,21 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         samples: desc.sample_count.max(1),
         swizzle,
     })
-    .ok()
+}
+
+/// A texture's layout in console memory, as the console's layout library
+/// gives it (`victory-hle`'s `xg` serves the same): the description's
+/// layout field is `0x100 | swizzle mode`, 1 linear, 0 the library's pick.
+pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
+    texture::Texture::new(&texture_desc(desc)?).ok()
+}
+
+/// Resolves and validates a texture's console swizzle mode without allocating
+/// its layout tables.
+fn texture_swizzle(desc: &ResourceDesc) -> Option<u32> {
+    texture::Texture::validate_swizzle(&texture_desc(desc)?)
+        .ok()
+        .map(|s| s.0)
 }
 
 /// Bytes and alignment a resource takes: buffers their width (64 KiB
@@ -786,6 +798,9 @@ pub(crate) struct HostTexture {
     bytes: u64,
     /// A list used it (counted once).
     used: std::sync::atomic::AtomicBool,
+    /// Replaced in `MEMORY` by another host texture for the same memory key;
+    /// once set, [`current`] falls back to checking `MEMORY`.
+    replaced: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(windows)]
@@ -811,6 +826,7 @@ impl HostTexture {
             twin: std::sync::OnceLock::new(),
             bytes,
             used: false.into(),
+            replaced: false.into(),
         }
     }
 
@@ -1065,7 +1081,7 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
         depth_or_array: desc.depth_or_array_size,
         mips: mip_count(desc),
         samples: desc.sample_count.max(1),
-        swizzle: texture_layout(desc).map_or(desc.layout, |t| t.planes[0].layout.desc.swizzle.0),
+        swizzle: texture_swizzle(desc).unwrap_or(desc.layout),
         element: element(desc.format)?,
         depth: desc.flags & DEPTH != 0,
     })
@@ -1088,12 +1104,56 @@ pub(crate) fn castable(format: u32) -> Vec<u32> {
         .collect()
 }
 
+#[cfg(any(windows, test))]
+type MemoryMap<K, T> =
+    std::sync::Mutex<Option<std::collections::HashMap<K, std::sync::Weak<T>>>>;
+
 /// Live host textures by texture memory: title textures (resource objects
 /// and placed views) of one memory share one.
 #[cfg(windows)]
-static MEMORY: std::sync::Mutex<
-    Option<std::collections::HashMap<MemoryKey, std::sync::Weak<HostTexture>>>,
-> = std::sync::Mutex::new(None);
+static MEMORY: MemoryMap<MemoryKey, HostTexture> = std::sync::Mutex::new(None);
+
+/// Inserts `new` into `map` under `key`, marking any replaced `live` entry
+/// before publishing the replacement so lock-free [`is_current`] checks fall
+/// back to `map`.
+#[cfg(any(windows, test))]
+fn replace_entry<K: Eq + std::hash::Hash, T>(
+    map: &mut std::collections::HashMap<K, std::sync::Weak<T>>,
+    key: K,
+    live: Option<&std::sync::Arc<T>>,
+    replaced: impl FnOnce(&T) -> &std::sync::atomic::AtomicBool,
+    new: &std::sync::Arc<T>,
+) {
+    if let Some(prev) = live {
+        replaced(prev).store(true, std::sync::atomic::Ordering::Release);
+    }
+    if map.len().is_power_of_two() {
+        map.retain(|_, w| w.strong_count() > 0);
+    }
+    map.insert(key, std::sync::Arc::downgrade(new));
+}
+
+/// Whether `entry` is still its memory's host texture: lock-free fast path
+/// while `replaced` is `false`, falling back to `map` once replaced so an
+/// entry whose replacement later dropped still reports current.
+#[cfg(any(windows, test))]
+fn is_current<K: Eq + std::hash::Hash, T>(
+    entry: &std::sync::Arc<T>,
+    replaced: &std::sync::atomic::AtomicBool,
+    key: impl FnOnce() -> Option<K>,
+    map: &MemoryMap<K, T>,
+) -> bool {
+    if !replaced.load(std::sync::atomic::Ordering::Acquire) {
+        return true;
+    }
+    let Some(k) = key() else {
+        return true;
+    };
+    let map = map.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()
+        .and_then(|m| m.get(&k)?.upgrade())
+        .is_none_or(|live| std::sync::Arc::ptr_eq(&live, entry))
+}
 
 /// The host texture of the memory at `address` that `desc` describes: the
 /// live one if it takes `desc` (its uses, a format it can be viewed in),
@@ -1114,11 +1174,7 @@ fn shared_texture(
         && takes(t, &d)
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(host) = crate::host::host() {
-            // SAFETY: a plain query on a host description (same layout).
-            let info = unsafe { host.device.GetResourceAllocationInfo(0, &[std::ptr::from_ref(&d).cast::<windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC>().read_unaligned()]) };
-            SAVED.fetch_add(info.SizeInBytes, std::sync::atomic::Ordering::Relaxed);
-        }
+        SAVED.fetch_add(t.bytes, std::sync::atomic::Ordering::Relaxed);
         return live;
     }
     // shortcut: title textures of a replaced host texture keep it (placed
@@ -1130,10 +1186,7 @@ fn shared_texture(
             REPLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!(?k, "a texture memory's host texture replaced by one with more uses or another format");
         }
-        if map.len().is_power_of_two() {
-            map.retain(|_, w| w.strong_count() > 0);
-        }
-        map.insert(k, std::sync::Arc::downgrade(&t));
+        replace_entry(map, k, live.as_ref(), |prev| &prev.replaced, &t);
     }
     Some(t)
 }
@@ -1156,13 +1209,15 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
 #[cfg(windows)]
 fn current(this: This) -> bool {
     let r = resource(this);
-    let (Some(h), Some(k)) = (&r.host, memory_key(r.data() as u64, &r.desc)) else {
+    let Some(h) = &r.host else {
         return true;
     };
-    let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref()
-        .and_then(|m| m.get(&k)?.upgrade())
-        .is_none_or(|live| std::sync::Arc::ptr_eq(&live, h))
+    is_current(
+        h,
+        &h.replaced,
+        || memory_key(r.data() as u64, &r.desc),
+        &MEMORY,
+    )
 }
 
 /// A host texture of host description `d` in GPU memory, castable to
@@ -1191,7 +1246,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
     if !castable_formats.is_empty()
-        && let Ok(device) = host.device.cast::<ID3D12Device10>()
+        && let Some(device) = host.device10.as_ref()
     {
         // SAFETY: the description has the host layout (checked size).
         let p = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
@@ -2440,5 +2495,269 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn memory_key_matches_texture_layout() {
+        let dimensions = [BUFFER, 2, 3, 4, 5];
+        let layouts: Vec<u32> = [0, 1]
+            .into_iter()
+            .chain(0x100..=0x11f)
+            .chain(std::iter::once(0x200))
+            .collect();
+        // None, RT, DS, UAV, RT|DS, RT|DS|UAV
+        let flags_list = [0, 1, 2, 4, 3, 7];
+        let formats = [
+            0,   // invalid
+            6,   // 96-bit: element() knows it, texture::format() does not
+            20,  // planar D32S8
+            28,  // RGBA8
+            66,  // 1-bit invalid
+            71,  // BC1
+            98,  // BC7
+            118, // console planar D16S8
+            189, // console-only: element() knows it, texture::format() does not
+        ];
+        let samples_list = [1, 2, 4, 8];
+        let mips_list = [0, 1, 4, 17];
+        let extents = [
+            (0u64, 1u32, 1u16),
+            (1, 1, 1),
+            (1, 4, 1),
+            (4096, 1, 1),
+            (4096, 4096, 2),
+            (u64::MAX, 1, 1),
+        ];
+
+        let mut layout_some = 0usize;
+        let mut layout_none_with_key = 0usize;
+        let mut key_none = 0usize;
+
+        for dimension in dimensions {
+            for &layout in &layouts {
+                for flags in flags_list {
+                    for format in formats {
+                        for sample_count in samples_list {
+                            for mip_levels in mips_list {
+                                for (width, height, depth_or_array_size) in extents {
+                                    let desc = ResourceDesc {
+                                        dimension,
+                                        alignment: 0,
+                                        width,
+                                        height,
+                                        depth_or_array_size,
+                                        mip_levels,
+                                        format,
+                                        sample_count,
+                                        sample_quality: 0,
+                                        layout,
+                                        flags,
+                                    };
+                                    let slow_swizzle = texture_layout(&desc)
+                                        .map(|t| t.planes[0].layout.desc.swizzle.0);
+                                    let fast_swizzle = texture_swizzle(&desc);
+                                    assert_eq!(fast_swizzle, slow_swizzle, "{desc:?}");
+
+                                    let expected_key = if dimension == BUFFER {
+                                        None
+                                    } else {
+                                        element(format).map(|elem| MemoryKey {
+                                            address: 0x1_0000,
+                                            dimension,
+                                            width,
+                                            height,
+                                            depth_or_array: depth_or_array_size,
+                                            mips: mip_count(&desc),
+                                            samples: sample_count.max(1),
+                                            swizzle: slow_swizzle.unwrap_or(layout),
+                                            element: elem,
+                                            depth: flags & DEPTH != 0,
+                                        })
+                                    };
+                                    let actual_key = memory_key(0x1_0000, &desc);
+                                    assert_eq!(actual_key, expected_key, "{desc:?}");
+
+                                    match (actual_key.is_some(), slow_swizzle.is_some()) {
+                                        (true, true) => layout_some += 1,
+                                        (true, false) => layout_none_with_key += 1,
+                                        (false, _) => key_none += 1,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(layout_some > 0);
+        assert!(layout_none_with_key > 0);
+        assert!(key_none > 0);
+
+        // Edge cases outside the Cartesian grid: sample_count = 0, depth = 0,
+        // and extents just past MAX_EXTENT (16384).
+        for desc in [
+            ResourceDesc {
+                sample_count: 0,
+                ..texture(64, 64, 28, 1)
+            },
+            ResourceDesc {
+                depth_or_array_size: 0,
+                ..texture(64, 64, 28, 1)
+            },
+            texture(16385, 1, 28, 1),
+            texture(1, 16385, 28, 1),
+            ResourceDesc {
+                depth_or_array_size: 16385,
+                ..texture(1, 1, 28, 1)
+            },
+        ] {
+            assert_eq!(
+                texture_swizzle(&desc),
+                texture_layout(&desc).map(|t| t.planes[0].layout.desc.swizzle.0),
+                "{desc:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn replaced_flag_fast_path_and_fallback_state_machine() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct Entry {
+            replaced: AtomicBool,
+        }
+        impl Entry {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    replaced: AtomicBool::new(false),
+                })
+            }
+        }
+
+        let map: MemoryMap<u64, Entry> = Mutex::new(None);
+        let a = Entry::new();
+        let other_key_entry = Entry::new();
+
+        {
+            let mut guard = map.lock().unwrap();
+            let inner = guard.get_or_insert_with(Default::default);
+            replace_entry(inner, 1, None, |e| &e.replaced, &a);
+            replace_entry(inner, 2, None, |e| &e.replaced, &other_key_entry);
+
+            // Fast path: while `replaced` is false, `is_current` neither invokes
+            // the key closure nor locks `map` (proven by holding `guard` here).
+            let mut key_called = false;
+            assert!(is_current(
+                &a,
+                &a.replaced,
+                || {
+                    key_called = true;
+                    Some(1)
+                },
+                &map,
+            ));
+            assert!(!key_called);
+        }
+
+        // Replace `a` with `b` at key 1.
+        let b = Entry::new();
+        {
+            let mut guard = map.lock().unwrap();
+            let inner = guard.get_or_insert_with(Default::default);
+            let live = inner.get(&1).and_then(std::sync::Weak::upgrade);
+            assert!(live.as_ref().is_some_and(|l| Arc::ptr_eq(l, &a)));
+            replace_entry(inner, 1, live.as_ref(), |e| &e.replaced, &b);
+        }
+        assert!(a.replaced.load(Ordering::Acquire));
+        assert!(!b.replaced.load(Ordering::Acquire));
+        assert!(!other_key_entry.replaced.load(Ordering::Acquire));
+
+        // `b` takes the lock-free fast path without computing a key.
+        {
+            let _held = map.lock().unwrap();
+            let mut key_called = false;
+            assert!(is_current(
+                &b,
+                &b.replaced,
+                || {
+                    key_called = true;
+                    Some(1)
+                },
+                &map,
+            ));
+            assert!(!key_called);
+            // Independent key 2 is unaffected.
+            assert!(is_current(&other_key_entry, &other_key_entry.replaced, || Some(2), &map));
+        }
+
+        // `a` sees `replaced == true`, falls back to `map`, and observes `b != a`.
+        let mut key_called = false;
+        assert!(!is_current(
+            &a,
+            &a.replaced,
+            || {
+                key_called = true;
+                Some(1)
+            },
+            &map,
+        ));
+        assert!(key_called);
+
+        // When replacement `b` drops, `a`'s fallback sees no live entry in `map`
+        // and reports current (preserving exact pre-optimization semantics).
+        drop(b);
+        assert!(a.replaced.load(Ordering::Acquire));
+        assert!(is_current(&a, &a.replaced, || Some(1), &map));
+
+        // Monotonicity: once `c` later takes key 1 (with `live == None` because
+        // `b` dropped), `a.replaced` is still `true`, so `a` still falls back
+        // and detects `c`.
+        let c = Entry::new();
+        {
+            let mut guard = map.lock().unwrap();
+            let inner = guard.get_or_insert_with(Default::default);
+            let live = inner.get(&1).and_then(std::sync::Weak::upgrade);
+            assert!(live.is_none());
+            replace_entry(inner, 1, live.as_ref(), |e| &e.replaced, &c);
+        }
+        assert!(!is_current(&a, &a.replaced, || Some(1), &map));
+        assert!(is_current(&c, &c.replaced, || Some(1), &map));
+
+        // Edge cases on the fallback path: `key() == None` (no lock needed),
+        // uninitialized map, and self re-insertion.
+        {
+            let _held = map.lock().unwrap();
+            assert!(is_current(&a, &a.replaced, || None::<u64>, &map));
+        }
+        let empty_map: MemoryMap<u64, Entry> = Mutex::new(None);
+        assert!(is_current(&a, &a.replaced, || Some(1), &empty_map));
+        {
+            let mut guard = empty_map.lock().unwrap();
+            let inner = guard.get_or_insert_with(Default::default);
+            replace_entry(inner, 1, None, |e| &e.replaced, &a);
+        }
+        assert!(is_current(&a, &a.replaced, || Some(1), &empty_map));
+
+        // Power-of-two pruning drops dead weak entries while keeping live ones.
+        let temp = Entry::new();
+        {
+            let mut guard = map.lock().unwrap();
+            let inner = guard.get_or_insert_with(Default::default);
+            replace_entry(inner, 3, None, |e| &e.replaced, &temp);
+            replace_entry(inner, 4, None, |e| &e.replaced, &other_key_entry);
+            assert_eq!(inner.len(), 4); // power of two
+        }
+        drop(temp);
+        let d = Entry::new();
+        {
+            let mut guard = map.lock().unwrap();
+            let inner = guard.get_or_insert_with(Default::default);
+            replace_entry(inner, 5, None, |e| &e.replaced, &d);
+            assert!(!inner.contains_key(&3), "dead weak entry pruned");
+            assert!(inner.contains_key(&1));
+            assert!(inner.contains_key(&2));
+            assert!(inner.contains_key(&5));
+        }
     }
 }
