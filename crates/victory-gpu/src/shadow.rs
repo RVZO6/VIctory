@@ -181,13 +181,11 @@ impl Shadow {
         if !crate::host::read_into(from as *const u8, title) || title == host {
             return 0;
         }
-        {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
-        }
+        let writing = crate::watch::writing(from, n);
+        crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
         // Our write is not the title's: the copy holds the page as it is.
         if let Some(t) = &self.tracked {
-            t.taken(&[page / PAGE]);
+            writing.finish_taken(t, page / PAGE);
         }
         n
     }
@@ -423,14 +421,13 @@ impl Shadow {
     /// submission: title memory where the title has not written the page
     /// since the copy took it, else what the page held when the title first
     /// wrote it ([`crate::watch::Tracked::begin_copy_back`], if the page was
-    /// armed). Reuses `scratch` and appends `page / PAGE` to `taken` when it
-    /// needs re-guarding. Returns the bytes written.
+    /// armed). Reuses `scratch` and immediately re-guards a written full page
+    /// under the same `GUARDS` lock when finishing the write. Returns the bytes
+    /// written.
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
-    pub(crate) fn copy_back_marked(
-        &self, page: usize, scratch: &mut Vec<u8>, taken: &mut Vec<usize>,
-    ) -> usize {
+    pub(crate) fn copy_back_marked(&self, page: usize, scratch: &mut Vec<u8>) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -441,12 +438,12 @@ impl Shadow {
         }
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), to - from) };
-        Self::copy_back_marked_page(t, from, page, host, scratch, taken)
+        Self::copy_back_marked_page(t, from, page, host, scratch)
     }
 
     fn copy_back_marked_page(
         t: &crate::watch::Tracked, from: usize, page: usize,
-        host: &mut [u8], scratch: &mut Vec<u8>, taken: &mut Vec<usize>,
+        host: &mut [u8], scratch: &mut Vec<u8>,
     ) -> usize {
         // Our own write below must not save the page for this copy again.
         let Some(saved) = t.begin_copy_back(page / PAGE) else {
@@ -476,15 +473,16 @@ impl Shadow {
                 changed.then_some(title.as_ptr())
             }
         };
+        // Re-guard a written full page immediately under the same `GUARDS` lock
+        // as finishing `writing` so no concurrent CPU write can slip in before
+        // the next page is processed; leave previously opened unchanged pages
+        // in `changed.pages` so any racing CPU write after `read_into` survives.
         if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
+            let writing = crate::watch::writing(from, n);
             crate::host::write_mapped(from as *mut u8, bytes, n);
-        }
-        // Equal to title memory now: queue for re-guarding when written or
-        // previously opened (leaving an unchanged guarded page alone so a
-        // racing title write after `begin_copy_back` is not cleared).
-        if (written.is_some() || saved.is_some()) && from == page && n == PAGE {
-            taken.push(page / PAGE);
+            if from == page && n == PAGE {
+                writing.finish_taken(t, page / PAGE);
+            }
         }
         written.map_or(0, |_| n)
     }
@@ -770,15 +768,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
             })
             .collect()
     };
-    let (mut scratch, mut batch, mut current): (_, _, Option<Arc<Shadow>>) = (Vec::new(), Vec::new(), None);
-    let flush = |current: &mut Option<Arc<Shadow>>, batch: &mut Vec<usize>| {
-        if let Some(copy) = current.take()
-            && let Some(t) = &copy.tracked
-        {
-            t.taken(batch);
-        }
-        batch.clear();
-    };
+    let mut scratch = Vec::new();
     for (copy, page) in pages {
         if withheld
             .iter()
@@ -786,11 +776,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
         {
             continue;
         }
-        if current.as_ref().is_none_or(|c| !Arc::ptr_eq(c, &copy)) {
-            flush(&mut current, &mut batch);
-            current = Some(copy.clone());
-        }
-        let written = copy.copy_back_marked(page, &mut scratch, &mut batch);
+        let written = copy.copy_back_marked(page, &mut scratch);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::MarkedPages, 1);
@@ -799,7 +785,6 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
     }
-    flush(&mut current, &mut batch);
 }
 
 /// Returns an `n`-byte slice inside `scratch`, allocating and zeroing one page
@@ -1193,8 +1178,10 @@ mod tests {
     }
 
     /// Multi-page marked copy-back reuses one scratch buffer, combines
-    /// unarm/saved/changed in `begin_copy_back`, batches `taken()`, preserves
-    /// racing writes on unchanged guarded pages, and re-arms VEH faults.
+    /// unarm/saved/changed in `begin_copy_back`, re-guards each written page
+    /// atomically via `finish_taken` so concurrent CPU writes between pages are
+    /// never lost, preserves unchanged previously-opened pages in `changed`,
+    /// and re-arms VEH faults.
     #[test]
     fn batched_copy_back_reuses_scratch_batches_taken_and_rearms() {
         const N: usize = 8;
@@ -1209,45 +1196,60 @@ mod tests {
         ] {
             host[off] = v;
         }
-        // SAFETY: committed pool bytes; faults save armed pages 1 and 6.
+        // SAFETY: committed pool bytes; faults save armed pages 1, 3, and 6.
         unsafe {
             ((p + PAGE + 40) as *mut u8).write_volatile(0x11);
+            ((p + 3 * PAGE + 5) as *mut u8).write_volatile(0x33); // opened, unchanged by GPU
             ((p + 6 * PAGE + 12) as *mut u8).write_volatile(0x66);
             ((p + 7 * PAGE + 16) as *mut u8).write_volatile(0x77);
         }
-        let (mut scratch, mut batch, mut ptr) = (Vec::new(), Vec::new(), None);
-        for k in [0, 1, 2, 3, 4, 5, 7] {
+        let mut scratch = Vec::new();
+        // Copy back page 0 first, then simulate a concurrent CPU write to page 0
+        // BEFORE pages 1..7 are processed: page 0 must already be re-guarded so
+        // the CPU write faults, marks page 0 changed, and is never lost.
+        assert_eq!(Shadow::copy_back_marked_page(&t, p, p, &mut host[..PAGE], &mut scratch), PAGE);
+        assert!(!t.changed(p / PAGE));
+        let ptr = Some(scratch.as_ptr());
+        // SAFETY: page 0 was re-guarded immediately by `finish_taken`.
+        unsafe { ((p + 100) as *mut u8).write_volatile(0x55) };
+        assert!(t.changed(p / PAGE), "concurrent CPU write after page 0 copy-back must fault and stay changed");
+
+        for k in [1, 2, 3, 4, 5, 7] {
             let page = p + k * PAGE;
-            let n = Shadow::copy_back_marked_page(&t, page, page, &mut host[k * PAGE..][..PAGE], &mut scratch, &mut batch);
+            let n = Shadow::copy_back_marked_page(&t, page, page, &mut host[k * PAGE..][..PAGE], &mut scratch);
             assert_eq!(n, if matches!(k, 3 | 7) { 0 } else { PAGE });
-            ptr = Some(*ptr.get_or_insert(scratch.as_ptr()));
             assert_eq!(Some(scratch.as_ptr()), ptr, "scratch buffer reused");
         }
-        assert_eq!(batch, [0, 1, 2, 4, 5].map(|k| p / PAGE + k));
-        // Racing CPU write to unchanged guarded page 3 before `taken(&batch)` survives.
-        // SAFETY: guarded pool page; VEH opens and marks it changed.
-        unsafe { ((p + 3 * PAGE + 5) as *mut u8).write_volatile(0x33) };
-        t.taken(&batch);
-        assert!([0, 1, 2, 4, 5].into_iter().all(|k| !t.changed(p / PAGE + k)));
-        assert!(t.changed(p / PAGE + 3) && t.changed(p / PAGE + 6) && t.changed(p / PAGE + 7));
+        // Page 0 stayed changed from its concurrent CPU write; pages 1, 2, 4, 5
+        // were written and immediately re-guarded; page 3 (previously opened,
+        // unchanged by GPU) stayed in `changed`; pages 6, 7 stayed changed.
+        assert!([1, 2, 4, 5].into_iter().all(|k| !t.changed(p / PAGE + k)));
+        assert!([0, 3, 6, 7].into_iter().all(|k| t.changed(p / PAGE + k)));
         for (off, want) in [
-            (10, 0xaa), (PAGE + 20, 0xbb), (PAGE + 40, 0x11), (2 * PAGE + 30, 0xcc),
-            (3 * PAGE + 5, 0x33), (4 * PAGE + 40, 0xdd), (5 * PAGE + 50, 0xee),
-            (6 * PAGE + 12, 0x66), (7 * PAGE + 16, 0x77), (7 * PAGE + 60, 0),
+            (10, 0xaa), (100, 0x55), (PAGE + 20, 0xbb), (PAGE + 40, 0x11),
+            (2 * PAGE + 30, 0xcc), (3 * PAGE + 5, 0x33), (4 * PAGE + 40, 0xdd),
+            (5 * PAGE + 50, 0xee), (6 * PAGE + 12, 0x66), (7 * PAGE + 16, 0x77),
+            (7 * PAGE + 60, 0),
         ] {
             // SAFETY: reading committed bytes of our pool.
             assert_eq!(unsafe { ((p + off) as *const u8).read_volatile() }, want);
         }
         assert_eq!(host[PAGE + 40], 0x11);
-        // Re-arm and verify batched `taken()` restored read-only guards for VEH faults.
+        // Re-arm and verify `finish_taken` restored read-only guards for VEH faults.
         t.arm(p, p + N * PAGE);
-        // SAFETY: guarded pool pages re-armed after `taken(&batch)`.
+        // SAFETY: guarded pool pages re-armed after `finish_taken`.
         unsafe {
-            ((p + 10) as *mut u8).write_volatile(0x99);
+            ((p + PAGE + 10) as *mut u8).write_volatile(0x99);
             ((p + 5 * PAGE + 50) as *mut u8).write_volatile(0x88);
         }
-        assert!(t.changed(p / PAGE) && !t.changed(p / PAGE + 2) && t.changed(p / PAGE + 5));
-        assert_eq!((t.begin_copy_back(p / PAGE).flatten().unwrap()[10], t.begin_copy_back(p / PAGE + 5).flatten().unwrap()[50]), (0xaa, 0xee));
+        assert!(t.changed(p / PAGE + 1) && !t.changed(p / PAGE + 2) && t.changed(p / PAGE + 5));
+        assert_eq!(
+            (
+                t.begin_copy_back(p / PAGE + 1).flatten().unwrap()[20],
+                t.begin_copy_back(p / PAGE + 5).flatten().unwrap()[50],
+            ),
+            (0xbb, 0xee),
+        );
         assert_eq!(t.begin_copy_back(p / PAGE + 2), Some(None));
         drop(t);
         crate::watch::tests::free(p);

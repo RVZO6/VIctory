@@ -269,7 +269,8 @@ impl Drop for Tracked {
 
 /// Gives write access back to guarded pages in `pages`, coalescing consecutive
 /// pages into one `VirtualProtect` per run (falling back per page across holes
-/// or distinct reservations). Returns how many pages were opened.
+/// or distinct reservations). Uses a small stack buffer for `<= 16` pages so
+/// the VEH fault path avoids heap allocation. Returns how many pages were opened.
 fn open_runs(g: &mut Guards, pages: &[usize]) -> usize {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let set = |first: usize, count: usize| {
@@ -279,40 +280,66 @@ fn open_runs(g: &mut Guards, pages: &[usize]) -> usize {
             VirtualProtect((first * PAGE) as *const _, count * PAGE, PAGE_READWRITE, &mut old) != 0
         }
     };
-    let mut to_open: Vec<usize> = match pages {
-        [] => return 0,
+    let open_slice = |to_open: &mut [usize]| -> usize {
+        if to_open.is_empty() {
+            return 0;
+        }
+        if !to_open.is_sorted() {
+            to_open.sort_unstable();
+        }
+        let mut i = 0;
+        while i < to_open.len() {
+            let first = i;
+            while i + 1 < to_open.len() && to_open[i + 1] == to_open[i] + 1 {
+                i += 1;
+            }
+            let run = &to_open[first..=i];
+            i += 1;
+            if !set(run[0], run.len()) && run.len() > 1 {
+                for &p in run {
+                    set(p, 1);
+                }
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::OpenPages, to_open.len() as u64);
+        to_open.len()
+    };
+    match pages {
+        [] => 0,
         &[p] if g.protected.remove(&p) => {
             set(p, 1);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::OpenPages, 1);
-            return 1;
+            1
         }
-        [_] => return 0,
-        _ => pages.iter().copied().filter(|p| g.protected.remove(p)).collect(),
-    };
-    if to_open.is_empty() {
-        return 0;
-    }
-    if !to_open.is_sorted() {
-        to_open.sort_unstable();
-    }
-    let mut i = 0;
-    while i < to_open.len() {
-        let first = i;
-        while i + 1 < to_open.len() && to_open[i + 1] == to_open[i] + 1 {
-            i += 1;
-        }
-        let run = &to_open[first..=i];
-        i += 1;
-        if !set(run[0], run.len()) && run.len() > 1 {
-            for &p in run {
-                set(p, 1);
+        [_] => 0,
+        _ => {
+            let mut stack = [0usize; 16];
+            let mut len = 0usize;
+            let mut heap = Vec::new();
+            for &p in pages {
+                if !g.protected.remove(&p) {
+                    continue;
+                }
+                if !heap.is_empty() {
+                    heap.push(p);
+                } else if len < stack.len() {
+                    stack[len] = p;
+                    len += 1;
+                } else {
+                    heap.reserve(pages.len());
+                    heap.extend_from_slice(&stack);
+                    heap.push(p);
+                }
+            }
+            if heap.is_empty() {
+                open_slice(&mut stack[..len])
+            } else {
+                open_slice(&mut heap)
             }
         }
     }
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::OpenPages, to_open.len() as u64);
-    to_open.len()
 }
 
 impl Tracked {
@@ -497,37 +524,12 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
     taken
 }
 
-/// Pages `[first, last)` changed, and so the pages showing the same memory
-/// elsewhere: gives write access back where we guarded them and marks them
-/// in every tracker holding them. True if one of `[first, last)` was
-/// guarded.
-fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
-    let guarded = changed_here(g, first, last, save);
-    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
-    #[cfg(feature = "diagnostics")]
-    {
-        let held = others.iter().filter(|p| g.holders.contains_key(p)).count();
-        crate::copystat::add(crate::copystat::C::AliasMarks, held as u64);
-    }
-    open_runs(g, &others);
-    for page in others {
-        changed_here(g, page, page + 1, save);
-    }
-    guarded
-}
-
-/// [`changed`] of `[first, last)` alone. With `save`, before the write
-/// lands: trackers armed for a page they had taken keep its bytes.
-fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+/// Marks every tracker holding pages in `[first, last)`. With `save`, snapshots
+/// armed pages while they (and their aliases) are still read-only.
+fn mark_holders(g: &mut Guards, first: usize, last: usize, save: bool) {
     if first >= last {
-        return false;
+        return;
     }
-    let opened = if last - first == 1 {
-        open_runs(g, &[first])
-    } else {
-        let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-        open_runs(g, &guarded)
-    };
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders {
             c.mark(page, save);
@@ -535,7 +537,78 @@ fn changed_here(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         g.written.insert(page);
     }
-    opened > 0
+}
+
+/// Gives write access back to guarded pages in `[first, last)`.
+fn open_range(g: &mut Guards, first: usize, last: usize) -> usize {
+    if first >= last {
+        return 0;
+    }
+    if last - first == 1 {
+        return open_runs(g, &[first]);
+    }
+    let mut stack = [0usize; 16];
+    let mut len = 0usize;
+    let mut heap = Vec::new();
+    for &p in g.protected.range(first..last) {
+        if !heap.is_empty() {
+            heap.push(p);
+        } else if len < stack.len() {
+            stack[len] = p;
+            len += 1;
+        } else {
+            heap.extend_from_slice(&stack);
+            heap.push(p);
+        }
+    }
+    if heap.is_empty() {
+        open_runs(g, &stack[..len])
+    } else {
+        open_runs(g, &heap)
+    }
+}
+
+/// Pages `[first, last)` changed, and so the pages showing the same memory
+/// elsewhere: snapshots armed holders (when `save`) while all aliases are
+/// still read-only, then gives write access back where we guarded them.
+/// True if one of `[first, last)` was guarded.
+fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
+    let mut stack = [0usize; 16];
+    let mut len = 0usize;
+    let mut heap = Vec::new();
+    for (_, links) in g.alias_of.range(first..last) {
+        for &p in links {
+            if !heap.is_empty() {
+                heap.push(p);
+            } else if len < stack.len() {
+                stack[len] = p;
+                len += 1;
+            } else {
+                heap.extend_from_slice(&stack);
+                heap.push(p);
+            }
+        }
+    }
+    let others = if heap.is_empty() {
+        &stack[..len]
+    } else {
+        heap.as_slice()
+    };
+    #[cfg(feature = "diagnostics")]
+    {
+        let held = others.iter().filter(|p| g.holders.contains_key(p)).count();
+        crate::copystat::add(crate::copystat::C::AliasMarks, held as u64);
+    }
+    // Mark and snapshot armed holders BEFORE removing read-only guards on
+    // `[first, last)` or any alias so no concurrent writer can corrupt saved
+    // pre-write bytes.
+    mark_holders(g, first, last, save);
+    for &page in others {
+        mark_holders(g, page, page + 1, save);
+    }
+    let guarded = open_range(g, first, last) > 0;
+    open_runs(g, others);
+    guarded
 }
 
 /// At each presented frame (diagnostics): counts the tracked pages written
@@ -558,10 +631,35 @@ pub(crate) fn frame_done() {
 pub struct Writing {
     first: usize,
     last: usize,
+    finished: bool,
+}
+
+impl Writing {
+    /// Ends this write and, under the same `GUARDS` lock, marks `page` taken
+    /// on `tracked` and immediately restores its read-only guard (and aliases)
+    /// so no concurrent CPU write can land unguarded after copy-back.
+    pub(crate) fn finish_taken(mut self, tracked: &Tracked, page: usize) {
+        self.finished = true;
+        let mut g = guards();
+        if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
+            g.busy.swap_remove(i);
+        }
+        changed(&mut g, self.first, self.last, false);
+        let mut state = tracked.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+        let others = aliases(&g, &[page]);
+        guard_aliases(&mut g, &others);
+        for p in protect(&mut g, &[page]) {
+            state.pages.remove(&p);
+            state.bytes.remove(&p);
+        }
+    }
 }
 
 impl Drop for Writing {
     fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
         let mut g = guards();
         if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
             g.busy.swap_remove(i);
@@ -582,7 +680,7 @@ pub fn writing(at: usize, len: usize) -> Writing {
     let mut g = guards();
     g.busy.push((first, last));
     changed(&mut g, first, last, true);
-    Writing { first, last }
+    Writing { first, last, finished: false }
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -617,17 +715,17 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
 }
 
 /// Batched [`title_memory_aliased`]: links each `(at, others)` pair both ways
-/// under one guard lock and protects aliased mappings in coalesced runs.
+/// under one guard lock, propagates protection across transitive alias chains,
+/// and protects aliased mappings in coalesced runs.
 pub fn title_memory_aliased_batch<'a>(entries: impl IntoIterator<Item = (usize, &'a [usize])>) {
     let mut iter = entries.into_iter().filter(|(_, o)| !o.is_empty()).peekable();
     if iter.peek().is_none() {
         return;
     }
     let mut g = guards();
-    let mut to_protect = Vec::new();
+    let mut worklist = Vec::new();
     for (at, others) in iter {
         let page = at / PAGE;
-        let mut guarded = false;
         for &other in others {
             let other = other / PAGE;
             if other == page {
@@ -639,10 +737,26 @@ pub fn title_memory_aliased_batch<'a>(entries: impl IntoIterator<Item = (usize, 
                     links.push(y);
                 }
             }
-            guarded |= g.protected.contains(&other);
+            if g.protected.contains(&other) && !g.protected.contains(&page) {
+                worklist.push(page);
+            } else if g.protected.contains(&page) && !g.protected.contains(&other) {
+                worklist.push(other);
+            }
         }
-        if guarded {
-            to_protect.push(page);
+    }
+    let mut seen = BTreeSet::new();
+    let mut to_protect = Vec::new();
+    while let Some(p) = worklist.pop() {
+        if g.protected.contains(&p) || !seen.insert(p) {
+            continue;
+        }
+        to_protect.push(p);
+        if let Some(links) = g.alias_of.get(&p) {
+            for &n in links {
+                if !g.protected.contains(&n) && !seen.contains(&n) {
+                    worklist.push(n);
+                }
+            }
         }
     }
     if !to_protect.is_empty() {
@@ -961,6 +1075,36 @@ pub(crate) mod tests {
         title_memory_remapped(b, len);
         title_memory_remapped(a, len);
         drop(t);
+    }
+
+    /// Chained aliases inside a single `title_memory_aliased_batch` call
+    /// (both forward `[(a, &[b]), (c, &[a])]` and reverse `[(c, &[a]), (a, &[b])]`)
+    /// propagate read-only guards across the entire chain.
+    #[test]
+    fn title_memory_aliased_batch_propagates_chained_aliases() {
+        for reverse in [false, true] {
+            let (b, a) = twin_section(1);
+            let c = pool(1);
+            let t = track(b, PAGE, true).expect("views are tracked");
+            assert_eq!(t.take(b, b + PAGE), [(b, b + PAGE)]);
+            assert!(!writable(b) && writable(a) && writable(c));
+            if reverse {
+                title_memory_aliased_batch([(c, &[a][..]), (a, &[b][..])]);
+            } else {
+                title_memory_aliased_batch([(a, &[b][..]), (c, &[a][..])]);
+            }
+            assert!(!writable(a), "direct alias `a` must be guarded (reverse={reverse})");
+            assert!(!writable(c), "chained alias `c` must be guarded (reverse={reverse})");
+            // Writing through `c` must fault and open/mark `a` as well.
+            // SAFETY: committed guarded pool page `c`.
+            unsafe { (c as *mut u32).write_volatile(0x1234_5678) };
+            assert!(writable(c));
+            title_memory_remapped(c, PAGE);
+            title_memory_remapped(a, PAGE);
+            title_memory_remapped(b, PAGE);
+            drop(t);
+            free(c);
+        }
     }
 
     /// `open_runs` restores write access across contiguous runs and falls back
