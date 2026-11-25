@@ -69,22 +69,21 @@ unsafe impl Sync for Staging {}
 /// A host copy or resolve writes `resource`: its host texture's contents
 /// are the host's, not title memory's, which stays as it was.
 pub(crate) fn host_written(resource: This) {
-    if let Some(copy) = crate::resource::host_copy(resource) {
+    if let Some(copy) = crate::resource::host_copy_ref(resource) {
         copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 fn is_host_written(resource: This) -> bool {
-    crate::resource::host_copy(resource)
+    crate::resource::host_copy_ref(resource)
         .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Whether `resource`'s host copy takes its contents from title memory:
-/// a texture the host GPU does not render to or write.
-pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
-    const TARGET_DEPTH_UNORDERED: i32 = 0x7;
-    // SAFETY: a live resource.
-    unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
+/// Whether a host texture with resource flags `flags` takes its contents
+/// from title memory: a texture the host GPU does not render to or write.
+pub(crate) fn title_written_flags(flags: u32) -> bool {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    flags & TARGET_DEPTH_UNORDERED == 0
 }
 
 /// Copies [`alias_copy`] recorded since the last frame-rate line.
@@ -416,7 +415,7 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 /// The staging state of a title texture's host texture, made on first use
 /// (one for all title textures of its memory).
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
-    let copy = crate::resource::host_copy(resource)?;
+    let copy = crate::resource::host_copy_ref(resource)?;
     let mut held = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = held.as_ref() {
         return Some(s.clone());
@@ -486,6 +485,27 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_written_flags_accepts_only_non_writable_textures() {
+        // Low 4 D3D12_RESOURCE_FLAGS bits: 0x1 RT, 0x2 DS, 0x4 UAV, 0x8 DENY_SRV.
+        // Only textures with none of RT/DS/UAV set are title-written.
+        for flags in 0u32..16 {
+            assert_eq!(
+                title_written_flags(flags),
+                flags & 0x7 == 0,
+                "flags={flags:#x}"
+            );
+        }
+        assert!(title_written_flags(0x0));
+        assert!(title_written_flags(0x8));
+        assert!(title_written_flags(0xFFFF_FFF8));
+        assert!(!title_written_flags(0x1));
+        assert!(!title_written_flags(0x2));
+        assert!(!title_written_flags(0x4));
+        assert!(!title_written_flags(0x7));
+        assert!(!title_written_flags(0xFFFF_FFFF));
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {

@@ -276,15 +276,22 @@ pub(crate) fn family(format: u32) -> u32 {
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
+/// The format a view of a title texture must name when its host copy has
+/// another format (typeless, or shared with another format): the title's
+/// own (as the host knows it); `None` if the host copy has the same format.
+#[cfg(any(windows, test))]
+pub(crate) fn view_format_for(title_format: u32, host_format: u32) -> Option<u32> {
+    let own = pc_format(title_format);
+    (host_format != own).then_some(own)
+}
+
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
+#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
-    let own = pc_format(resource(this).desc.format);
-    let host = host_resource(this)?;
-    // SAFETY: a live resource.
-    let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    (format != own).then_some(own)
+    let copy = host_copy_ref(this)?;
+    view_format_for(resource(this).desc.format, copy.format)
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -770,6 +777,10 @@ struct Resource {
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    /// Resource flags from `GetDesc()`, immutable for the texture's lifetime.
+    pub(crate) flags: u32,
+    /// DXGI format from `GetDesc()`, immutable for the texture's lifetime.
+    pub(crate) format: u32,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// Formats views may take besides the texture's own family: the host
     /// took them as castable formats when it made the texture.
@@ -796,14 +807,21 @@ impl HostTexture {
         state: u32,
         castable: Vec<u32>,
     ) -> Self {
+        // SAFETY: plain query on a live resource.
+        let desc = unsafe { texture.GetDesc() };
+        let flags = desc.Flags.0 as u32;
+        let format = desc.Format.0 as u32;
+        let state = crate::host::legal_for(flags, state);
         let bytes = crate::host::host().map_or(0, |h| {
-            // SAFETY: plain queries on a live resource.
-            unsafe { h.device.GetResourceAllocationInfo(0, &[texture.GetDesc()]) }.SizeInBytes
+            // SAFETY: plain query on a live device with a valid description.
+            unsafe { h.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes
         });
         TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
             texture,
+            flags,
+            format,
             state: state.into(),
             castable,
             host_written: false.into(),
@@ -812,6 +830,12 @@ impl HostTexture {
             bytes,
             used: false.into(),
         }
+    }
+
+    /// Whether this host texture takes its contents from title memory:
+    /// a texture the host GPU does not render to or write.
+    pub(crate) fn title_written(&self) -> bool {
+        crate::texture::title_written_flags(self.flags)
     }
 
     /// A list uses it: counted the first time (diagnostics of how much of
@@ -983,6 +1007,15 @@ pub(crate) fn host_resource<'a>(
     resource(this).host.as_deref().map(|h| &h.texture)
 }
 
+/// A title texture's host copy, borrowed (no reference-count increment).
+#[cfg(windows)]
+pub(crate) fn host_copy_ref(this: This) -> Option<&'static std::sync::Arc<HostTexture>> {
+    if this.is_null() {
+        return None;
+    }
+    resource(this).host.as_ref()
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
@@ -1030,7 +1063,7 @@ const DEPTH: u32 = 2;
 #[cfg(windows)]
 const UNORDERED: u32 = 4;
 /// Render target, depth, unordered access: what a host texture allows.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const USES: u32 = 0x7;
 
 /// What a texture memory is, for the one host texture it gets: its address
@@ -1138,17 +1171,22 @@ fn shared_texture(
     Some(t)
 }
 
+/// Whether a host texture with cached `flags`, `own_format`, and `castable`
+/// formats takes a title texture of host description `d`: its uses, and a
+/// view format of its family or castable list.
+#[cfg(any(windows, test))]
+fn takes_meta(flags: u32, own_format: u32, castable: &[u32], d: &ResourceDesc) -> bool {
+    d.flags & USES & !flags == 0
+        && (family(d.format) == family(own_format)
+            || castable.iter().any(|&c| family(c) == family(d.format)))
+}
+
 /// Whether host texture `t` takes a title texture of host description
 /// `d` at its memory: its uses, and a view format of its family or
 /// castable list.
 #[cfg(windows)]
 fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
-    // SAFETY: a live resource.
-    let td = unsafe { t.texture.GetDesc() };
-    let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
-    d.flags & USES & !flags == 0
-        && (family(d.format) == family(own)
-            || t.castable.iter().any(|&c| family(c) == family(d.format)))
+    takes_meta(t.flags, t.format, &t.castable, d)
 }
 
 /// Whether `this`'s host texture is still its memory's (not replaced by one
@@ -1258,7 +1296,6 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         // Its address, for the lifetime notes (`life`) of a freed one.
         format!("texture {}x{} f{} flags {:#x} @{:#x}", d.width, d.height, d.format, d.flags, texture.as_raw() as usize)
     });
-    let initial = crate::host::legal_state(&texture, initial);
     Some(HostTexture::new(texture, initial, castable_formats))
 }
 
@@ -1851,6 +1888,76 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn view_format_for_reports_own_pc_format_only_when_host_differs() {
+        // Typed host copies matching the title's own format need no override.
+        assert_eq!(view_format_for(28, 28), None);
+        assert_eq!(view_format_for(29, 29), None);
+        assert_eq!(view_format_for(40, 40), None);
+        assert_eq!(view_format_for(71, 71), None);
+        // Typeless host copies (sRGB UAVs, readable depth) require the title's format.
+        assert_eq!(view_format_for(29, 27), Some(29));
+        assert_eq!(view_format_for(91, 90), Some(91));
+        assert_eq!(view_format_for(93, 92), Some(93));
+        assert_eq!(view_format_for(28, 27), Some(28));
+        for &(typed, typeless) in &DEPTH_FORMATS {
+            assert_eq!(view_format_for(typed, typeless), Some(typed));
+            assert_eq!(view_format_for(typed, typed), None);
+        }
+        // Console 16-bit depth/stencil maps through pc_format (118..=120 -> 45..=47).
+        for (console, pc) in [(118, 45), (119, 46), (120, 47)] {
+            assert_eq!(view_format_for(console, 44), Some(pc));
+            assert_eq!(view_format_for(console, pc), None);
+        }
+        assert_eq!(view_format_for(118, 46), Some(45));
+        // Shared host texture with another format of the same element size.
+        assert_eq!(view_format_for(28, 42), Some(28));
+    }
+
+    #[test]
+    fn takes_meta_checks_required_uses_and_format_compatibility() {
+        let with = |format, flags| ResourceDesc {
+            flags,
+            ..texture(64, 64, format, 1)
+        };
+        // Uses parity: USES = 0x7 (RT | DS | UAV); DENY_SRV (0x8) is ignored.
+        assert!(takes_meta(0, 28, &[], &with(28, 0)));
+        assert!(takes_meta(0, 28, &[], &with(28, 0x8)));
+        assert!(!takes_meta(0, 28, &[], &with(28, 0x1)));
+        assert!(!takes_meta(0, 28, &[], &with(28, 0x2)));
+        assert!(!takes_meta(0, 28, &[], &with(28, 0x4)));
+        assert!(takes_meta(0x5, 28, &[], &with(28, 0x1)));
+        assert!(takes_meta(0x5, 28, &[], &with(28, 0x4)));
+        assert!(takes_meta(0x5, 28, &[], &with(28, 0x5)));
+        assert!(takes_meta(0x5, 28, &[], &with(28, 0xD)));
+        assert!(!takes_meta(0x5, 28, &[], &with(28, 0x2)));
+        assert!(!takes_meta(0x5, 28, &[], &with(28, 0x7)));
+        assert!(takes_meta(0x7, 28, &[], &with(28, 0x7)));
+
+        // Same format family without castable list.
+        for f in [27, 28, 29, 30, 31, 32] {
+            assert!(takes_meta(0, 28, &[], &with(f, 0)), "RGBA8 family {f}");
+            assert!(takes_meta(0, 27, &[], &with(f, 0)), "RGBA8 typeless {f}");
+        }
+        assert!(!takes_meta(0, 28, &[], &with(42, 0)));
+        assert!(!takes_meta(0, 28, &[], &with(87, 0)));
+        assert!(!takes_meta(0, 60, &[], &with(65, 0)));
+
+        // Castable formats accept other families of the same element size.
+        let c = castable(42);
+        for f in [27, 28, 29, 67, 87, 90] {
+            assert!(takes_meta(0x4, 42, &c, &with(f, 0x4)), "castable {f}");
+        }
+        // D32_FLOAT (40) shares R32_TYPELESS family 39 with R32_UINT (42).
+        assert!(takes_meta(0x4, 42, &c, &with(40, 0x4)));
+        // Different element size (10: 8B, 71: BC1) or depth family excluded from castable (45: D24S8).
+        assert!(!takes_meta(0x4, 42, &c, &with(10, 0x4)));
+        assert!(!takes_meta(0x4, 42, &c, &with(45, 0x4)));
+        assert!(!takes_meta(0x4, 42, &c, &with(71, 0x4)));
+        // Missing use flag rejects even when format is castable.
+        assert!(!takes_meta(0, 42, &c, &with(28, 0x1)));
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {

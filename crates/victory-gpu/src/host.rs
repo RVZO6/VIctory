@@ -43,15 +43,18 @@ pub(crate) struct Host {
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
-    rtvs: ID3D12DescriptorHeap,
+    _rtvs: ID3D12DescriptorHeap,
+    rtv_start: usize,
     rtv_size: u32,
-    /// A ring of depth views, used as `rtvs`.
-    dsvs: ID3D12DescriptorHeap,
+    /// A ring of depth views, used as `_rtvs`.
+    _dsvs: ID3D12DescriptorHeap,
+    dsv_start: usize,
     dsv_size: u32,
     next_dsv: AtomicU32,
     /// A ring of CPU-only views, for the CPU handles of unordered access
-    /// clears, used as `rtvs`.
-    cpu_views: ID3D12DescriptorHeap,
+    /// clears, used as `_rtvs`.
+    _cpu_views: ID3D12DescriptorHeap,
+    cpu_view_start: usize,
     cpu_view_size: u32,
     next_cpu_view: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
@@ -206,6 +209,7 @@ fn create() -> windows::core::Result<Host> {
                 NumDescriptors: RTV_RING,
                 ..Default::default()
             })?;
+        let rtv_start = rtvs.GetCPUDescriptorHandleForHeapStart().ptr;
         let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         let dsvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -213,6 +217,7 @@ fn create() -> windows::core::Result<Host> {
                 NumDescriptors: RTV_RING,
                 ..Default::default()
             })?;
+        let dsv_start = dsvs.GetCPUDescriptorHandleForHeapStart().ptr;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         let cpu_views: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -220,6 +225,7 @@ fn create() -> windows::core::Result<Host> {
                 NumDescriptors: RTV_RING,
                 ..Default::default()
             })?;
+        let cpu_view_start = cpu_views.GetCPUDescriptorHandleForHeapStart().ptr;
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
@@ -243,12 +249,15 @@ fn create() -> windows::core::Result<Host> {
             fence,
             submitted: Mutex::new(0),
             event,
-            rtvs,
+            _rtvs: rtvs,
+            rtv_start,
             rtv_size,
-            dsvs,
+            _dsvs: dsvs,
+            dsv_start,
             dsv_size,
             next_dsv: AtomicU32::new(0),
-            cpu_views,
+            _cpu_views: cpu_views,
+            cpu_view_start,
             cpu_view_size,
             next_cpu_view: AtomicU32::new(0),
             messages,
@@ -303,6 +312,82 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn legal_for_strips_only_states_forbidden_by_resource_flags() {
+        const RT: u32 = 0x4;
+        const UAV: u32 = 0x8;
+        const DEPTH_WRITE: u32 = 0x10;
+        const DEPTH_READ: u32 = 0x20;
+        const NON_PS_SRV: u32 = 0x40;
+        const PS_SRV: u32 = 0x80;
+        const ALWAYS_ALLOWED: u32 = 0x400 | 0x800 | 0x1000 | 0x2000;
+        const ALL: u32 = RT | UAV | DEPTH_WRITE | DEPTH_READ | NON_PS_SRV | PS_SRV | ALWAYS_ALLOWED;
+
+        for flags in 0u32..16 {
+            let mut expected = ALWAYS_ALLOWED;
+            if flags & 0x1 != 0 {
+                expected |= RT;
+            }
+            if flags & 0x2 != 0 {
+                expected |= DEPTH_WRITE | DEPTH_READ;
+            }
+            if flags & 0x4 != 0 {
+                expected |= UAV;
+            }
+            if flags & 0x8 == 0 {
+                expected |= NON_PS_SRV | PS_SRV;
+            }
+            assert_eq!(legal_for(flags, ALL), expected, "flags={flags:#x}");
+            // Unrelated high flag bits do not affect state legality.
+            assert_eq!(legal_for(flags | 0x100, ALL), expected, "flags={flags:#x}");
+            // Common state (0) stays 0 for every flag combination.
+            assert_eq!(legal_for(flags, 0), 0, "flags={flags:#x}");
+            // Each individual state bit passes iff present in `expected`.
+            for state in [
+                RT,
+                UAV,
+                DEPTH_WRITE,
+                DEPTH_READ,
+                NON_PS_SRV,
+                PS_SRV,
+                0x400,
+                0x800,
+            ] {
+                let want = if expected & state != 0 { state } else { 0 };
+                assert_eq!(
+                    legal_for(flags, state),
+                    want,
+                    "flags={flags:#x} state={state:#x}"
+                );
+            }
+        }
+        // Depth texture with DENY_SHADER_RESOURCE strips SRV but keeps DEPTH_READ.
+        assert_eq!(legal_for(0x2 | 0x8, DEPTH_READ | PS_SRV | NON_PS_SRV), DEPTH_READ);
+        // Depth texture without ALLOW_UNORDERED_ACCESS strips UAV.
+        assert_eq!(legal_for(0x2, UAV), 0);
+    }
+
+    #[test]
+    fn ring_handle_offsets_and_wraps_across_rtv_ring() {
+        assert!(RTV_RING.is_power_of_two());
+        let start = 0x0000_7ff0_0001_0000usize;
+        let step = 32u32;
+        assert_eq!(ring_handle(start, step, 0).ptr, start);
+        assert_eq!(ring_handle(start, step, 1).ptr, start + 32);
+        assert_eq!(
+            ring_handle(start, step, RTV_RING - 1).ptr,
+            start + (RTV_RING as usize - 1) * 32
+        );
+        // Wraps seamlessly at RTV_RING and across u32::MAX -> 0.
+        assert_eq!(ring_handle(start, step, RTV_RING).ptr, start);
+        assert_eq!(ring_handle(start, step, RTV_RING + 5).ptr, start + 5 * 32);
+        assert_eq!(
+            ring_handle(start, step, u32::MAX).ptr,
+            start + (RTV_RING as usize - 1) * 32
+        );
+        assert_eq!(ring_handle(start, step, u32::MAX.wrapping_add(1)).ptr, start);
+    }
 
     #[test]
     fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
@@ -457,12 +542,217 @@ mod tests {
         node.pCommandListDebugNameA = longer.as_ptr().cast();
         assert!(!list.is_node(&node), "a number that only starts with ours is no match");
     }
+
+    #[test]
+    fn deferred_clear_retains_steady_state_capacity_and_shrinks_bursts() {
+        let mut d = Deferred::default();
+
+        // Steady-state population below RETAINED_CAP: capacities must survive clear().
+        const STEADY: usize = 32;
+        for i in 0..STEADY {
+            d.copies.push(Step::Memory(i));
+            d.kept.ptrs.insert(i);
+            d.refreshed.insert((i, 0, 64));
+            d.textures.insert(i);
+            d.writes.push((i, crate::queue::Written::Value(i as u64), 8));
+            d.after.push(Box::new(|| {}));
+            d.missed.push(Box::new(|| false));
+        }
+        d.uploads.reserve(STEADY);
+        d.kept.items.reserve(STEADY);
+        d.budget_zeroed = true;
+
+        let steady_caps = (
+            d.copies.capacity(),
+            d.uploads.capacity(),
+            d.kept.items.capacity(),
+            d.kept.ptrs.capacity(),
+            d.refreshed.capacity(),
+            d.textures.capacity(),
+            d.writes.capacity(),
+            d.after.capacity(),
+            d.missed.capacity(),
+        );
+        assert!(steady_caps.0 >= STEADY && steady_caps.0 <= RETAINED_CAP);
+        assert!(steady_caps.1 >= STEADY && steady_caps.1 <= RETAINED_CAP);
+        assert!(steady_caps.2 >= STEADY && steady_caps.2 <= RETAINED_CAP);
+        assert!(steady_caps.3 >= STEADY && steady_caps.3 <= RETAINED_CAP);
+        assert!(steady_caps.4 >= STEADY && steady_caps.4 <= RETAINED_CAP);
+        assert!(steady_caps.5 >= STEADY && steady_caps.5 <= RETAINED_CAP);
+        assert!(steady_caps.6 >= STEADY && steady_caps.6 <= RETAINED_CAP);
+        assert!(steady_caps.7 >= STEADY && steady_caps.7 <= RETAINED_CAP);
+        assert!(steady_caps.8 >= STEADY && steady_caps.8 <= RETAINED_CAP);
+
+        d.clear();
+
+        assert!(d.copies.is_empty());
+        assert!(d.uploads.is_empty());
+        assert!(d.kept.items.is_empty());
+        assert!(d.kept.ptrs.is_empty());
+        assert!(d.refreshed.is_empty());
+        assert!(d.textures.is_empty());
+        assert!(d.writes.is_empty());
+        assert!(!d.budget_zeroed);
+        assert!(d.after.is_empty());
+        assert!(d.missed.is_empty());
+        assert_eq!(
+            (
+                d.copies.capacity(),
+                d.uploads.capacity(),
+                d.kept.items.capacity(),
+                d.kept.ptrs.capacity(),
+                d.refreshed.capacity(),
+                d.textures.capacity(),
+                d.writes.capacity(),
+                d.after.capacity(),
+                d.missed.capacity(),
+            ),
+            steady_caps,
+            "steady-state capacities are preserved across Deferred::clear",
+        );
+
+        // Runaway burst well past RETAINED_CAP: clear() must shrink back to cap.
+        const BURST: usize = RETAINED_CAP * 4;
+        for i in 0..BURST {
+            d.copies.push(Step::Memory(i));
+            d.kept.ptrs.insert(i);
+            d.refreshed.insert((i, 0, 64));
+            d.textures.insert(i);
+            d.writes.push((i, crate::queue::Written::Value(i as u64), 8));
+            d.after.push(Box::new(|| {}));
+            d.missed.push(Box::new(|| false));
+        }
+        d.uploads.reserve_exact(BURST);
+        d.kept.items.reserve_exact(BURST);
+        d.budget_zeroed = true;
+
+        let burst_set_cap = d.textures.capacity();
+        assert!(d.copies.capacity() >= BURST);
+        assert!(d.uploads.capacity() >= BURST);
+        assert!(d.kept.items.capacity() >= BURST);
+        assert!(d.kept.ptrs.capacity() >= BURST);
+        assert!(d.refreshed.capacity() >= BURST);
+        assert!(burst_set_cap >= BURST);
+        assert!(d.writes.capacity() >= BURST);
+        assert!(d.after.capacity() >= BURST);
+        assert!(d.missed.capacity() >= BURST);
+
+        d.clear();
+
+        let set_cap_tier = std::collections::HashSet::<usize>::with_capacity(RETAINED_CAP).capacity();
+        assert!(!d.budget_zeroed);
+        assert_eq!(d.copies.capacity(), RETAINED_CAP);
+        assert_eq!(d.uploads.capacity(), RETAINED_CAP);
+        assert_eq!(d.kept.items.capacity(), RETAINED_CAP);
+        assert!(d.kept.ptrs.capacity() < burst_set_cap && d.kept.ptrs.capacity() <= set_cap_tier);
+        assert!(d.refreshed.capacity() < burst_set_cap && d.refreshed.capacity() <= set_cap_tier);
+        assert!(d.textures.capacity() < burst_set_cap && d.textures.capacity() <= set_cap_tier);
+        assert_eq!(d.writes.capacity(), RETAINED_CAP);
+        assert_eq!(d.after.capacity(), RETAINED_CAP);
+        assert_eq!(d.missed.capacity(), RETAINED_CAP);
+    }
+
+    #[test]
+    fn keep_set_deduplicates_by_pointer_and_re_retains_after_clear() {
+        let mut keep = KeepSet::<u32>::default();
+        let mut calls = 0usize;
+
+        assert!(keep.insert_with(0x1000, || {
+            calls += 1;
+            Some(1)
+        }));
+        assert!(!keep.insert_with(0x1000, || {
+            calls += 1;
+            Some(99)
+        }));
+        assert!(keep.insert_with(0x2000, || {
+            calls += 1;
+            Some(2)
+        }));
+        assert!(!keep.insert_with(0x2000, || {
+            calls += 1;
+            Some(99)
+        }));
+        assert_eq!(calls, 2);
+        assert_eq!(keep.items, vec![1, 2]);
+
+        // A failed retain must not poison the pointer set.
+        assert!(!keep.insert_with(0x3000, || {
+            calls += 1;
+            None
+        }));
+        assert_eq!(calls, 3);
+        assert!(!keep.ptrs.contains(&0x3000));
+        assert!(keep.insert_with(0x3000, || {
+            calls += 1;
+            Some(3)
+        }));
+        assert_eq!(calls, 4);
+        assert_eq!(keep.items, vec![1, 2, 3]);
+
+        // After clear(), previously seen pointers are retained again.
+        let (items_cap, ptrs_cap) = (keep.items.capacity(), keep.ptrs.capacity());
+        keep.clear(RETAINED_CAP);
+        assert!(keep.items.is_empty());
+        assert!(keep.ptrs.is_empty());
+        assert_eq!((keep.items.capacity(), keep.ptrs.capacity()), (items_cap, ptrs_cap));
+
+        assert!(keep.insert_with(0x1000, || {
+            calls += 1;
+            Some(10)
+        }));
+        assert_eq!(calls, 5);
+        assert_eq!(keep.items, vec![10]);
+    }
+
+    #[test]
+    fn collect_unique_heaps_deduplicates_by_pointer_in_order() {
+        use std::sync::Arc;
+
+        // Empty input does not allocate.
+        let empty: [Vec<Arc<u32>>; 2] = [Vec::new(), Vec::new()];
+        let none = collect_unique_heaps(&empty, |list, push| {
+            for item in list {
+                push(item);
+            }
+        });
+        assert!(none.is_empty());
+        assert_eq!(none.capacity(), 0);
+
+        let a = Arc::new(1u32);
+        let b = Arc::new(2u32);
+        let c = Arc::new(3u32);
+        // Same value as `a`, distinct allocation: pointer dedup keeps both.
+        let a_distinct = Arc::new(1u32);
+
+        let lists = [
+            vec![Arc::clone(&a), Arc::clone(&b), Arc::clone(&a)],
+            vec![Arc::clone(&b), Arc::clone(&c)],
+            vec![Arc::clone(&a_distinct), Arc::clone(&a), Arc::clone(&c)],
+        ];
+        let unique = collect_unique_heaps(&lists, |list, push| {
+            for item in list {
+                push(item);
+            }
+        });
+        assert_eq!(unique.len(), 4);
+        assert!(Arc::ptr_eq(&unique[0], &a));
+        assert!(Arc::ptr_eq(&unique[1], &b));
+        assert!(Arc::ptr_eq(&unique[2], &c));
+        assert!(Arc::ptr_eq(&unique[3], &a_distinct));
+    }
 }
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
+    /// Cached `ID3D12GraphicsCommandList6` interface for `DispatchMesh`.
+    pub(crate) list6: Option<ID3D12GraphicsCommandList6>,
+    /// Bumped whenever the list records a deferred title copy, title-writing
+    /// work, or GPU buffer write, so draw state caches re-refresh and re-bind
+    /// vertex and index buffers.
+    copy_epoch: std::sync::atomic::AtomicU64,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -485,7 +775,7 @@ pub(crate) struct HostList {
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
-    pipelines: Mutex<std::collections::BTreeSet<String>>,
+    pipelines: Mutex<std::collections::BTreeSet<std::sync::Arc<str>>>,
     /// Which list this is, for the name that tells it apart in device-removed
     /// data (see [`HostList::is_node`]).
     id: u64,
@@ -650,6 +940,103 @@ enum Step {
     Memory(usize),
 }
 
+/// Maximum collection capacity retained across command-list resets: steady-state
+/// frames avoid heap re-allocations while one-off loading bursts release excess
+/// memory.
+pub(crate) const RETAINED_CAP: usize = 1024;
+
+pub(crate) fn clear_vec<T>(v: &mut Vec<T>, cap: usize) {
+    v.clear();
+    if v.capacity() > cap {
+        v.shrink_to(cap);
+    }
+}
+
+pub(crate) fn clear_set<T: Eq + std::hash::Hash>(
+    s: &mut std::collections::HashSet<T>,
+    cap: usize,
+) {
+    s.clear();
+    if s.capacity() > cap {
+        s.shrink_to(cap);
+    }
+}
+
+pub(crate) fn clear_map<K: Eq + std::hash::Hash, V>(
+    m: &mut std::collections::HashMap<K, V>,
+    cap: usize,
+) {
+    m.clear();
+    if m.capacity() > cap {
+        m.shrink_to(cap);
+    }
+}
+
+/// Host objects kept alive until a list is reset, deduplicated by raw pointer
+/// so repeated binds skip COM `QueryInterface`/`AddRef`.
+///
+/// Soundness: once `raw` is recorded in `ptrs`, a strong reference is held in
+/// `items` until [`KeepSet::clear`] runs after GPU execution finishes, so the
+/// object's address cannot be freed or reused while present in `ptrs`.
+struct KeepSet<T> {
+    items: Vec<T>,
+    ptrs: std::collections::HashSet<usize>,
+}
+
+impl<T> Default for KeepSet<T> {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            ptrs: std::collections::HashSet::new(),
+        }
+    }
+}
+
+impl<T> KeepSet<T> {
+    /// Retains `raw` at most once until [`KeepSet::clear`], invoking `retain`
+    /// only on the first sight of `raw`. If `retain` returns `None`, `raw` is
+    /// removed from `ptrs` so state stays consistent.
+    fn insert_with(&mut self, raw: usize, retain: impl FnOnce() -> Option<T>) -> bool {
+        if !self.ptrs.insert(raw) {
+            return false;
+        }
+        match retain() {
+            Some(item) => {
+                self.items.push(item);
+                true
+            }
+            None => {
+                self.ptrs.remove(&raw);
+                false
+            }
+        }
+    }
+
+    fn clear(&mut self, cap: usize) {
+        clear_set(&mut self.ptrs, cap);
+        clear_vec(&mut self.items, cap);
+    }
+}
+
+/// Collects unique `Arc<T>` items across `lists` in first-seen order,
+/// deduplicating by `Arc::as_ptr` without intermediate per-list allocations.
+fn collect_unique_heaps<L, T>(
+    lists: &[L],
+    mut visit: impl FnMut(&L, &mut dyn FnMut(&std::sync::Arc<T>)),
+) -> Vec<std::sync::Arc<T>> {
+    let mut heaps: Vec<std::sync::Arc<T>> = Vec::new();
+    let mut push = |heap: &std::sync::Arc<T>| {
+        let ptr = std::sync::Arc::as_ptr(heap);
+        if !heaps.iter().any(|h| std::sync::Arc::as_ptr(h) == ptr) {
+            heaps.push(std::sync::Arc::clone(heap));
+        }
+    };
+    for list in lists {
+        visit(list, &mut push);
+    }
+    heaps
+}
+
 /// What a list does on the CPU when it is submitted: copies between host
 /// memory regions (title buffers, upload buffers and buffer copies), and
 /// the upload buffers its GPU commands read, kept until the list is reset.
@@ -661,7 +1048,7 @@ struct Deferred {
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
-    kept: Vec<windows::core::IUnknown>,
+    kept: KeepSet<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -679,6 +1066,34 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+}
+
+impl Deferred {
+    /// Clears all per-recording state in-place, retaining steady-state
+    /// capacities while shrinking runaway burst allocations back to
+    /// [`RETAINED_CAP`].
+    fn clear(&mut self) {
+        let Self {
+            copies,
+            uploads,
+            kept,
+            refreshed,
+            textures,
+            writes,
+            budget_zeroed,
+            after,
+            missed,
+        } = self;
+        clear_vec(copies, RETAINED_CAP);
+        clear_vec(uploads, RETAINED_CAP);
+        kept.clear(RETAINED_CAP);
+        clear_set(refreshed, RETAINED_CAP);
+        clear_set(textures, RETAINED_CAP);
+        clear_vec(writes, RETAINED_CAP);
+        *budget_zeroed = false;
+        clear_vec(after, RETAINED_CAP);
+        clear_vec(missed, RETAINED_CAP);
+    }
 }
 
 impl Host {
@@ -775,9 +1190,12 @@ impl Host {
             prelude.Close()?;
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
+            let list6 = list.cast().ok();
             Ok(HostList {
                 allocator,
                 list,
+                list6,
+                copy_epoch: std::sync::atomic::AtomicU64::new(0),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -812,19 +1230,13 @@ impl Host {
         crate::descriptor::sync_heaps();
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
-        let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
-            .iter()
-            .flat_map(|l| {
-                l.deferred()
-                    .copies
-                    .iter()
-                    .filter_map(|s| match s {
-                        Step::Heap(v) => Some(v.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let heaps = collect_unique_heaps(runs, |list, push| {
+            for step in &list.deferred().copies {
+                if let Step::Heap(v) = step {
+                    push(v);
+                }
+            }
+        });
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
         let uploads = (!heaps.is_empty())
@@ -832,13 +1244,17 @@ impl Host {
             .flatten();
         #[cfg(feature = "diagnostics")]
         drop(uploading);
-        let runs: Vec<&HostList> = uploads
-            .as_ref()
-            .map(|u| u.list())
-            .into_iter()
-            .chain(runs.iter().copied())
-            .collect();
-        let runs = &runs[..];
+        let with_uploads: Vec<&HostList>;
+        let runs: &[&HostList] = match uploads.as_ref() {
+            Some(u) => {
+                let mut combined = Vec::with_capacity(runs.len() + 1);
+                combined.push(u.list());
+                combined.extend_from_slice(runs);
+                with_uploads = combined;
+                &with_uploads
+            }
+            None => runs,
+        };
         // A frame `crate::capture` lists: every command of every list, in
         // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
         // notes them).
@@ -933,10 +1349,17 @@ impl Host {
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
-            let pipelines: std::collections::BTreeSet<String> = runs
-                .iter()
-                .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
-                .collect();
+            let mut pipelines: std::collections::BTreeSet<std::sync::Arc<str>> =
+                std::collections::BTreeSet::new();
+            for l in runs {
+                pipelines.extend(
+                    l.pipelines
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .cloned(),
+                );
+            }
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
         }
         // SAFETY: a plain query.
@@ -1207,24 +1630,26 @@ impl Host {
         resource: &ID3D12Resource,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        let handle = ring_handle(
+            self.rtv_start,
+            self.rtv_size,
+            self.next_rtv.fetch_add(1, Ordering::Relaxed),
+        );
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
-            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.rtv_size) as usize;
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
-            handle
         }
+        handle
     }
 
     /// A slot of CPU-only views, valid until it is recorded.
     pub(crate) fn cpu_view(&self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_cpu_view.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a live heap.
-        let mut handle = unsafe { self.cpu_views.GetCPUDescriptorHandleForHeapStart() };
-        handle.ptr += (slot * self.cpu_view_size) as usize;
-        handle
+        ring_handle(
+            self.cpu_view_start,
+            self.cpu_view_size,
+            self.next_cpu_view.fetch_add(1, Ordering::Relaxed),
+        )
     }
 
     /// A host depth view of `resource`, valid until it is recorded.
@@ -1233,15 +1658,26 @@ impl Host {
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        let handle = ring_handle(
+            self.dsv_start,
+            self.dsv_size,
+            self.next_dsv.fetch_add(1, Ordering::Relaxed),
+        );
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
-            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.dsv_size) as usize;
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
-            handle
         }
+        handle
+    }
+}
+
+/// CPU descriptor handle at slot `ticket % RTV_RING` of a descriptor ring
+/// starting at `start` with increment `step`.
+fn ring_handle(start: usize, step: u32, ticket: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    let slot = ticket % RTV_RING;
+    D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: start + slot as usize * step as usize,
     }
 }
 
@@ -1365,14 +1801,15 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        *self.deferred() = Deferred::default();
-        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.deferred().clear();
+        self.copy_epoch.fetch_add(1, Ordering::Relaxed);
+        clear_map(&mut self.states.lock().unwrap_or_else(|e| e.into_inner()), RETAINED_CAP);
+        clear_map(&mut self.twins.lock().unwrap_or_else(|e| e.into_inner()), RETAINED_CAP);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        clear_vec(&mut self.notes.lock().unwrap_or_else(|e| e.into_inner()), RETAINED_CAP);
         #[cfg(feature = "diagnostics")]
-        self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        clear_vec(&mut self.targets.lock().unwrap_or_else(|e| e.into_inner()), RETAINED_CAP);
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -1389,7 +1826,8 @@ impl HostList {
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
-    /// list: the host texture and the state it leaves, if that is a change.
+    /// list: the host texture, the state it leaves, and the legal state it
+    /// moves to, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
     /// the texture there at submission.
     /// A depth texture with a writable twin (`crate::twin`) has the side
@@ -1399,16 +1837,16 @@ impl HostList {
         &self,
         resource: crate::object::This,
         wanted: u32,
-    ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
-        let copy = crate::resource::host_copy(resource)?;
+    ) -> Option<(&'static ID3D12Resource, u32, u32)> {
+        let copy = crate::resource::host_copy_ref(resource)?;
         if let Some(Some(twin)) = copy.twin.get()
-            && crate::twin::route(self, &copy, twin, wanted)
+            && crate::twin::route(self, copy, twin, wanted)
         {
             return None;
         }
-        let wanted = legal_state(texture, wanted);
-        self.track(&copy, wanted).map(|before| (texture, before))
+        let wanted = legal_for(copy.flags, wanted);
+        self.track(copy, wanted)
+            .map(|before| (&copy.texture, before, wanted))
     }
 
     /// The list's state for host texture `copy` becomes `wanted` (a legal
@@ -1436,7 +1874,7 @@ impl HostList {
         copy: &std::sync::Arc<crate::resource::HostTexture>,
         wanted: u32,
     ) -> Option<D3D12_RESOURCE_BARRIER> {
-        let wanted = legal_state(&copy.texture, wanted);
+        let wanted = legal_for(copy.flags, wanted);
         let before = self.track(copy, wanted)?;
         Some(transition(
             &copy.texture,
@@ -1514,7 +1952,7 @@ impl HostList {
                     let mut back = Vec::new();
                     twin.copy(list, depth, *to_depth, &mut |t, wanted| {
                         let real = t.state.load(Ordering::Relaxed);
-                        let wanted = legal_state(&t.texture, wanted);
+                        let wanted = legal_for(t.flags, wanted);
                         (real != wanted).then(|| {
                             back.push(transition(
                                 &t.texture,
@@ -1589,15 +2027,21 @@ impl HostList {
     }
 
     /// Notes a pipeline the list binds.
-    pub(crate) fn used_pipeline(&self, name: &str) {
+    pub(crate) fn used_pipeline(&self, name: &std::sync::Arc<str>) {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-        if !pipelines.contains(name) {
-            pipelines.insert(name.to_owned());
+        if !pipelines.contains(name.as_ref()) {
+            pipelines.insert(std::sync::Arc::clone(name));
         }
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Monotonic counter bumped whenever the list records a deferred copy,
+    /// title-writing work, GPU buffer write, or reset.
+    pub(crate) fn copy_epoch(&self) -> u64 {
+        self.copy_epoch.load(Ordering::Relaxed)
     }
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
@@ -1607,6 +2051,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        self.copy_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1648,6 +2093,7 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len, marked));
+        self.copy_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Shaders of the list take views from the heap itself
@@ -1760,9 +2206,10 @@ impl HostList {
 
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
-        if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
-        }
+        let raw = object.as_raw() as usize;
+        self.deferred()
+            .kept
+            .insert_with(raw, || object.cast::<windows::core::IUnknown>().ok());
     }
 
     /// Whether this is the first time since the reset that the list asks
@@ -1774,8 +2221,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        self.copy_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
