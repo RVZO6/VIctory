@@ -153,9 +153,9 @@ fn seen(view: &View) -> Option<Seen> {
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     if let View::Shader(resource, _) = view
-        && let Some(texture) = crate::resource::host_resource(*resource as This)
+        && let Some(copy) = crate::resource::host_copy_ref(*resource as This)
     {
-        return crate::texture::title_written(texture).then_some(Seen::Texture(*resource));
+        return copy.title_written().then_some(Seen::Texture(*resource));
     }
     // The copy the host view reads.
     let (shadow, address, len) = match *view {

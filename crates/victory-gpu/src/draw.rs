@@ -1735,10 +1735,10 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     }
     match (view, u.kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
-            if let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
+            if let Some(copy) = crate::resource::host_copy_ref(*resource as This)
+                && copy.title_written()
             {
-                crate::texture::upload(list, *resource as This, t);
+                crate::texture::upload(list, *resource as This, &copy.texture);
             }
             crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
             #[cfg(feature = "diagnostics")]

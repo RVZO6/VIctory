@@ -43,15 +43,18 @@ pub(crate) struct Host {
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
-    rtvs: ID3D12DescriptorHeap,
+    _rtvs: ID3D12DescriptorHeap,
+    rtv_start: usize,
     rtv_size: u32,
-    /// A ring of depth views, used as `rtvs`.
-    dsvs: ID3D12DescriptorHeap,
+    /// A ring of depth views, used as `_rtvs`.
+    _dsvs: ID3D12DescriptorHeap,
+    dsv_start: usize,
     dsv_size: u32,
     next_dsv: AtomicU32,
     /// A ring of CPU-only views, for the CPU handles of unordered access
-    /// clears, used as `rtvs`.
-    cpu_views: ID3D12DescriptorHeap,
+    /// clears, used as `_rtvs`.
+    _cpu_views: ID3D12DescriptorHeap,
+    cpu_view_start: usize,
     cpu_view_size: u32,
     next_cpu_view: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
@@ -206,6 +209,7 @@ fn create() -> windows::core::Result<Host> {
                 NumDescriptors: RTV_RING,
                 ..Default::default()
             })?;
+        let rtv_start = rtvs.GetCPUDescriptorHandleForHeapStart().ptr;
         let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         let dsvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -213,6 +217,7 @@ fn create() -> windows::core::Result<Host> {
                 NumDescriptors: RTV_RING,
                 ..Default::default()
             })?;
+        let dsv_start = dsvs.GetCPUDescriptorHandleForHeapStart().ptr;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         let cpu_views: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
@@ -220,6 +225,7 @@ fn create() -> windows::core::Result<Host> {
                 NumDescriptors: RTV_RING,
                 ..Default::default()
             })?;
+        let cpu_view_start = cpu_views.GetCPUDescriptorHandleForHeapStart().ptr;
         let cpu_view_size =
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
@@ -243,12 +249,15 @@ fn create() -> windows::core::Result<Host> {
             fence,
             submitted: Mutex::new(0),
             event,
-            rtvs,
+            _rtvs: rtvs,
+            rtv_start,
             rtv_size,
-            dsvs,
+            _dsvs: dsvs,
+            dsv_start,
             dsv_size,
             next_dsv: AtomicU32::new(0),
-            cpu_views,
+            _cpu_views: cpu_views,
+            cpu_view_start,
             cpu_view_size,
             next_cpu_view: AtomicU32::new(0),
             messages,
@@ -303,6 +312,82 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn legal_for_strips_only_states_forbidden_by_resource_flags() {
+        const RT: u32 = 0x4;
+        const UAV: u32 = 0x8;
+        const DEPTH_WRITE: u32 = 0x10;
+        const DEPTH_READ: u32 = 0x20;
+        const NON_PS_SRV: u32 = 0x40;
+        const PS_SRV: u32 = 0x80;
+        const ALWAYS_ALLOWED: u32 = 0x400 | 0x800 | 0x1000 | 0x2000;
+        const ALL: u32 = RT | UAV | DEPTH_WRITE | DEPTH_READ | NON_PS_SRV | PS_SRV | ALWAYS_ALLOWED;
+
+        for flags in 0u32..16 {
+            let mut expected = ALWAYS_ALLOWED;
+            if flags & 0x1 != 0 {
+                expected |= RT;
+            }
+            if flags & 0x2 != 0 {
+                expected |= DEPTH_WRITE | DEPTH_READ;
+            }
+            if flags & 0x4 != 0 {
+                expected |= UAV;
+            }
+            if flags & 0x8 == 0 {
+                expected |= NON_PS_SRV | PS_SRV;
+            }
+            assert_eq!(legal_for(flags, ALL), expected, "flags={flags:#x}");
+            // Unrelated high flag bits do not affect state legality.
+            assert_eq!(legal_for(flags | 0x100, ALL), expected, "flags={flags:#x}");
+            // Common state (0) stays 0 for every flag combination.
+            assert_eq!(legal_for(flags, 0), 0, "flags={flags:#x}");
+            // Each individual state bit passes iff present in `expected`.
+            for state in [
+                RT,
+                UAV,
+                DEPTH_WRITE,
+                DEPTH_READ,
+                NON_PS_SRV,
+                PS_SRV,
+                0x400,
+                0x800,
+            ] {
+                let want = if expected & state != 0 { state } else { 0 };
+                assert_eq!(
+                    legal_for(flags, state),
+                    want,
+                    "flags={flags:#x} state={state:#x}"
+                );
+            }
+        }
+        // Depth texture with DENY_SHADER_RESOURCE strips SRV but keeps DEPTH_READ.
+        assert_eq!(legal_for(0x2 | 0x8, DEPTH_READ | PS_SRV | NON_PS_SRV), DEPTH_READ);
+        // Depth texture without ALLOW_UNORDERED_ACCESS strips UAV.
+        assert_eq!(legal_for(0x2, UAV), 0);
+    }
+
+    #[test]
+    fn ring_handle_offsets_and_wraps_across_rtv_ring() {
+        assert!(RTV_RING.is_power_of_two());
+        let start = 0x0000_7ff0_0001_0000usize;
+        let step = 32u32;
+        assert_eq!(ring_handle(start, step, 0).ptr, start);
+        assert_eq!(ring_handle(start, step, 1).ptr, start + 32);
+        assert_eq!(
+            ring_handle(start, step, RTV_RING - 1).ptr,
+            start + (RTV_RING as usize - 1) * 32
+        );
+        // Wraps seamlessly at RTV_RING and across u32::MAX -> 0.
+        assert_eq!(ring_handle(start, step, RTV_RING).ptr, start);
+        assert_eq!(ring_handle(start, step, RTV_RING + 5).ptr, start + 5 * 32);
+        assert_eq!(
+            ring_handle(start, step, u32::MAX).ptr,
+            start + (RTV_RING as usize - 1) * 32
+        );
+        assert_eq!(ring_handle(start, step, u32::MAX.wrapping_add(1)).ptr, start);
+    }
 
     #[test]
     fn list_scratch_grows_to_fit_and_reuses_fenced_chunks() {
@@ -1207,24 +1292,26 @@ impl Host {
         resource: &ID3D12Resource,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        let handle = ring_handle(
+            self.rtv_start,
+            self.rtv_size,
+            self.next_rtv.fetch_add(1, Ordering::Relaxed),
+        );
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
-            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.rtv_size) as usize;
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
-            handle
         }
+        handle
     }
 
     /// A slot of CPU-only views, valid until it is recorded.
     pub(crate) fn cpu_view(&self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_cpu_view.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a live heap.
-        let mut handle = unsafe { self.cpu_views.GetCPUDescriptorHandleForHeapStart() };
-        handle.ptr += (slot * self.cpu_view_size) as usize;
-        handle
+        ring_handle(
+            self.cpu_view_start,
+            self.cpu_view_size,
+            self.next_cpu_view.fetch_add(1, Ordering::Relaxed),
+        )
     }
 
     /// A host depth view of `resource`, valid until it is recorded.
@@ -1233,15 +1320,26 @@ impl Host {
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        let handle = ring_handle(
+            self.dsv_start,
+            self.dsv_size,
+            self.next_dsv.fetch_add(1, Ordering::Relaxed),
+        );
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
-            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.dsv_size) as usize;
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
-            handle
         }
+        handle
+    }
+}
+
+/// CPU descriptor handle at slot `ticket % RTV_RING` of a descriptor ring
+/// starting at `start` with increment `step`.
+fn ring_handle(start: usize, step: u32, ticket: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    let slot = ticket % RTV_RING;
+    D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: start + slot as usize * step as usize,
     }
 }
 
@@ -1389,7 +1487,8 @@ impl HostList {
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
-    /// list: the host texture and the state it leaves, if that is a change.
+    /// list: the host texture, the state it leaves, and the legal state it
+    /// moves to, if that is a change.
     /// The list's first use of a texture records nothing: its prelude brings
     /// the texture there at submission.
     /// A depth texture with a writable twin (`crate::twin`) has the side
@@ -1399,16 +1498,16 @@ impl HostList {
         &self,
         resource: crate::object::This,
         wanted: u32,
-    ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
-        let copy = crate::resource::host_copy(resource)?;
+    ) -> Option<(&'static ID3D12Resource, u32, u32)> {
+        let copy = crate::resource::host_copy_ref(resource)?;
         if let Some(Some(twin)) = copy.twin.get()
-            && crate::twin::route(self, &copy, twin, wanted)
+            && crate::twin::route(self, copy, twin, wanted)
         {
             return None;
         }
-        let wanted = legal_state(texture, wanted);
-        self.track(&copy, wanted).map(|before| (texture, before))
+        let wanted = legal_for(copy.flags, wanted);
+        self.track(copy, wanted)
+            .map(|before| (&copy.texture, before, wanted))
     }
 
     /// The list's state for host texture `copy` becomes `wanted` (a legal
@@ -1436,7 +1535,7 @@ impl HostList {
         copy: &std::sync::Arc<crate::resource::HostTexture>,
         wanted: u32,
     ) -> Option<D3D12_RESOURCE_BARRIER> {
-        let wanted = legal_state(&copy.texture, wanted);
+        let wanted = legal_for(copy.flags, wanted);
         let before = self.track(copy, wanted)?;
         Some(transition(
             &copy.texture,
@@ -1514,7 +1613,7 @@ impl HostList {
                     let mut back = Vec::new();
                     twin.copy(list, depth, *to_depth, &mut |t, wanted| {
                         let real = t.state.load(Ordering::Relaxed);
-                        let wanted = legal_state(&t.texture, wanted);
+                        let wanted = legal_for(t.flags, wanted);
                         (real != wanted).then(|| {
                             back.push(transition(
                                 &t.texture,

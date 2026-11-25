@@ -16,6 +16,7 @@ use crate::host::host;
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
+    gpu: u64,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
@@ -188,6 +189,7 @@ impl HostHeap {
         let h = HostHeap {
             heap,
             cpu,
+            gpu,
             step,
             count,
             dynamic: extra,
@@ -614,11 +616,7 @@ impl HostHeap {
 
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
-        D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start.ptr + u64::from(index) * u64::from(self.step),
-        }
+        gpu_handle(self.gpu, self.step, index)
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -715,6 +713,14 @@ impl HostHeap {
     #[cfg(test)]
     pub(crate) fn made(&self, index: u32) -> bool {
         self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
+    }
+}
+
+/// GPU descriptor handle at `index` in a heap starting at `start` with
+/// increment `step`.
+fn gpu_handle(start: u64, step: u32, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+    D3D12_GPU_DESCRIPTOR_HANDLE {
+        ptr: start + u64::from(index) * u64::from(step),
     }
 }
 
@@ -1427,6 +1433,19 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_handle_offsets_by_index_and_step() {
+        let base = 0x0000_0100_0000_0000u64;
+        assert_eq!(gpu_handle(base, 32, 0).ptr, base);
+        assert_eq!(gpu_handle(base, 32, 1).ptr, base + 32);
+        assert_eq!(gpu_handle(base, 32, 1_000_000).ptr, base + 32_000_000);
+        // Widening to u64 before multiply avoids u32 overflow on large indices.
+        assert_eq!(
+            gpu_handle(base, 64, 1 << 27).ptr,
+            base + (1u64 << 27) * 64
+        );
+    }
 
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]

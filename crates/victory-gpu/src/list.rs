@@ -320,13 +320,13 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
-            let (texture, before) = list.transition(b.first, wanted)?;
+            let (texture, before, after) = list.transition(b.first, wanted)?;
             Some(Barrier {
                 kind: 0,
                 flags: 0,
                 first: texture.as_raw().cast_const().cast(),
                 second: 0xffff_ffff | (u64::from(before) << 32),
-                last: u64::from(crate::host::legal_state(texture, wanted)),
+                last: u64::from(after),
             })
         }
         1 => Some(Barrier {
@@ -405,9 +405,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-    if let Some((texture, before)) = list.transition(resource, state) {
-        let state = crate::host::legal_state(texture, state);
-        let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
+    if let Some((texture, before, after)) = list.transition(resource, state) {
+        let barrier = crate::host::transition(texture, State(before as i32), State(after as i32));
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -459,10 +458,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         };
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
-            crate::resource::host_resource(src),
+            crate::resource::host_copy_ref(src),
         ) {
-            if crate::texture::title_written(from) {
-                crate::texture::upload(list, src, from);
+            if from.title_written() {
+                crate::texture::upload(list, src, &from.texture);
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
@@ -470,7 +469,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(to, from) };
+            unsafe { list.list.CopyResource(to, &from.texture) };
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -552,14 +551,14 @@ extern "system" fn copy_texture_region(
             }
             _upload = buffer;
         } else {
-            let Some(texture) = crate::resource::host_resource(src.resource) else {
+            let Some(copy) = crate::resource::host_copy_ref(src.resource) else {
                 return;
             };
-            if crate::texture::title_written(texture) {
-                crate::texture::upload(list, src.resource, texture);
+            if copy.title_written() {
+                crate::texture::upload(list, src.resource, &copy.texture);
             }
             ensure_state(list, src.resource, COPY_SOURCE);
-            from.resource = texture.as_raw().cast_const().cast();
+            from.resource = copy.texture.as_raw().cast_const().cast();
         }
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
@@ -721,12 +720,12 @@ extern "system" fn clear_rtv(
         let rtv = host.rtv(texture, record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
+            if let Some((_, before, after)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
                 list.list.ResourceBarrier(&[crate::host::transition(
                     texture,
                     State(before as i32),
-                    State(RENDER_TARGET as i32),
+                    State(after as i32),
                 )]);
             }
             list.list.ClearRenderTargetView(rtv, color, rects);
