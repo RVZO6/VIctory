@@ -646,26 +646,39 @@ impl HostHeap {
             }
             return None;
         }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        // Generations start at 1, so a made slot's key is never 0.
-        let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
-        let Some(view) = view else {
-            // Not a view of ours (never written, or of a resource the
-            // title released): nothing to read.
+        let mut raw = [0u8; 12];
+        let valid_header = crate::host::read_into(handle as *const u8, &mut raw);
+        let clear = |made: &mut [u64]| {
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
                 self.make_null(index);
                 self.note_address(index, None);
             }
-            return None;
         };
-        if made[index as usize] != key {
-            self.apply_view(&mut made, index, key, &view, for_draw);
+        if !valid_header {
+            clear(&mut made);
+            return None;
         }
-        Some(view)
+        let [tag, i, generation] = read_header(&raw);
+        if tag != VIEW_TAG {
+            clear(&mut made);
+            return None;
+        }
+        // Generations start at 1, so a made slot's key is never 0.
+        let key = u64::from(generation) << 32 | u64::from(i);
+        with_views(|views| {
+            let Some(view) = views.get(i, generation) else {
+                // Not a view of ours (never written, or of a resource the
+                // title released): nothing to read.
+                clear(&mut made);
+                return None;
+            };
+            if made[index as usize] != key {
+                self.apply_view(&mut made, index, key, view, for_draw);
+            }
+            Some(view.clone())
+        })
     }
 
     fn apply_view(&self, made: &mut [u64], index: u32, key: u64, view: &View, for_draw: bool) {
@@ -694,28 +707,26 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
-    /// Makes host slots `first..last` from `start + index * step` (`for_draw =
-    /// false`), locking `self.made` once and `VIEWS` at most once for the range
-    /// and releasing `VIEWS` before any D3D12 view creation or nulling.
-    pub(crate) fn mirror_range(&self, first: u32, last: u32, start: u64, step: u64) {
+    /// Makes host slots `first..last` from safely copied title bytes `bytes`
+    /// (`for_draw = false`), locking `self.made` once and `VIEWS` at most once
+    /// while applying changed slots directly under `VIEWS` (zero `View::clone`
+    /// and no stale-`Resource*` window against concurrent `Drop for Resource`).
+    pub(crate) fn mirror_bytes(&self, first: u32, last: u32, step: u64, bytes: &[u8]) {
         let end = last.min(self.count);
         if first >= end {
             return;
         }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: `sync_heaps` checks that the dirty page covering `first..end`
-        // is readable, and `end <= self.count == made.len()`.
-        let updates = unsafe { classify_range(&made, first, end, start, step) };
-        for (index, key, view) in updates {
+        scan_bytes(&mut made, first, end, step, bytes, |made, index, key, view| {
             match view {
-                Some(view) => self.apply_view(&mut made, index, key, &view, false),
+                Some(view) => self.apply_view(made, index, key, view, false),
                 None => {
                     made[index as usize] = 0;
                     self.make_null(index);
                     self.note_address(index, None);
                 }
             }
-        }
+        });
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -746,24 +757,44 @@ impl HostHeap {
     }
 }
 
-/// Scans slots `first..end` against `made`, returning `(index, key, Option<View>)`
-/// only for changed or newly-stale slots. Acquires `VIEWS` at most once, skips
-/// empty unchanged slots without consulting `VIEWS`, and checks unchanged
-/// populated slots by generation only (no `View::clone()`).
-///
-/// # Safety
-/// Every `start + u64::from(index) * step` in `first..end` must be readable for
-/// at least 12 bytes (`[u32; 3]`).
-pub(super) unsafe fn classify_range(made: &[u64], first: u32, end: u32, start: u64, step: u64) -> Vec<(u32, u64, Option<View>)> {
+/// Reads the 12-byte `[tag, index, generation]` descriptor header safely from
+/// copied title bytes.
+fn read_header(bytes: &[u8]) -> [u32; 3] {
+    [
+        u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+        u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+    ]
+}
+
+/// Scans slots `first..end` from safely copied title bytes `bytes` (starting at
+/// slot `first`, `step` bytes apart) against `made`, invoking `visit` only for
+/// changed or newly-stale slots. Acquires `VIEWS` at most once, skips empty
+/// unchanged slots without consulting `VIEWS`, and checks unchanged populated
+/// slots by generation only (no `View::clone()`).
+fn scan_bytes(
+    made: &mut [u64],
+    first: u32,
+    end: u32,
+    step: u64,
+    bytes: &[u8],
+    mut visit: impl FnMut(&mut [u64], u32, u64, Option<&View>),
+) {
     assert!(end as usize <= made.len());
+    if first >= end {
+        return;
+    }
+    let step = step as usize;
+    let need = (end - 1 - first) as usize * step + 12;
+    assert!(bytes.len() >= need);
     let read = |index: u32| -> [u32; 3] {
-        // SAFETY: caller guarantees every slot in `first..end` is readable.
-        unsafe { ((start + u64::from(index) * step) as *const [u32; 3]).read_unaligned() }
+        let off = (index - first) as usize * step;
+        read_header(&bytes[off..off + 12])
     };
-    let (mut updates, mut index) = (Vec::new(), first);
+    let mut index = first;
     while index < end && read(index)[0] != VIEW_TAG {
         if made[index as usize] != 0 {
-            updates.push((index, 0, None));
+            visit(made, index, 0, None);
         }
         index += 1;
     }
@@ -772,20 +803,40 @@ pub(super) unsafe fn classify_range(made: &[u64], first: u32, end: u32, start: u
             for index in index..end {
                 let ([tag, i, generation], prev) = (read(index), made[index as usize]);
                 if tag != VIEW_TAG {
-                    if prev != 0 { updates.push((index, 0, None)); }
+                    if prev != 0 {
+                        visit(made, index, 0, None);
+                    }
                     continue;
                 }
                 let key = u64::from(generation) << 32 | u64::from(i);
                 if prev == key {
-                    if prev != 0 && !views.matches(i, generation) { updates.push((index, 0, None)); }
+                    if prev != 0 && !views.matches(i, generation) {
+                        visit(made, index, 0, None);
+                    }
                 } else if let Some(view) = views.get(i, generation) {
-                    updates.push((index, key, Some(view.clone())));
+                    visit(made, index, key, Some(view));
                 } else if prev != 0 {
-                    updates.push((index, 0, None));
+                    visit(made, index, 0, None);
                 }
             }
         });
     }
+}
+
+/// Pure safe wrapper around [`scan_bytes`] for unit tests.
+#[cfg(test)]
+pub(super) fn classify_bytes(
+    made: &[u64],
+    first: u32,
+    end: u32,
+    step: u64,
+    bytes: &[u8],
+) -> Vec<(u32, u64, Option<View>)> {
+    let mut snapshot = made.to_vec();
+    let mut updates = Vec::new();
+    scan_bytes(&mut snapshot, first, end, step, bytes, |_, index, key, view| {
+        updates.push((index, key, view.cloned()));
+    });
     updates
 }
 
@@ -1663,8 +1714,11 @@ mod tests {
         let sync_all = |batch: &mut [u64], reference: &mut [u64]| -> usize {
             (0..3).map(|p| {
                 let (first, end) = (p * per_page, (p + 1) * per_page);
-                // SAFETY: `first..end` lies inside `buf` and `end <= total`.
-                let got = unsafe { classify_range(batch, first, end, start, 32) };
+                let byte_from = first as usize * 32;
+                let byte_to = (end - 1) as usize * 32 + 12;
+                // SAFETY: `buf` stays pinned and no other reference mutates it during this read.
+                let slice = unsafe { std::slice::from_raw_parts((start as *const u8).add(byte_from), byte_to - byte_from) };
+                let got = classify_bytes(batch, first, end, 32, slice);
                 for &(idx, key, ref view) in &got {
                     batch[idx as usize] = view.as_ref().filter(|v| !is_placed_texture(v)).map_or(0, |_| key);
                 }
