@@ -192,6 +192,11 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Cached 4-dword rows (`index / 4`) loaded from the user-data CBV in the
+    /// entry block.
+    user_rows: HashMap<u32, V>,
+    /// Cached extracted user-data dwords (`index`) in the entry block.
+    user_vals: HashMap<u32, V>,
     /// Handles of root SRVs and UAVs read as bounded views, by user-data
     /// dword ([`Lower::root_view`]).
     root_views: HashMap<u32, V>,
@@ -596,6 +601,8 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            user_rows: HashMap::new(),
+            user_vals: HashMap::new(),
             root_views: HashMap::new(),
             samplers: Vec::new(),
             descriptors: x
@@ -1652,25 +1659,38 @@ impl<'a> Lower<'a> {
         let index = u.index;
         self.user_reads.insert(index, u);
         self.s.user_data = self.s.user_data.max(index + 1);
-        let h = match self.user_data {
-            Some(h) => h,
+        if let Some(&v) = self.user_vals.get(&index) {
+            return v;
+        }
+        let entry = self.s.entry;
+        let row = index / 4;
+        let r = match self.user_rows.get(&row) {
+            Some(&r) => r,
             None => {
-                let h = self.s.user_data_handle();
-                self.user_data = Some(h);
-                h
+                let h = match self.user_data {
+                    Some(h) => h,
+                    None => {
+                        let h = self.s.user_data_handle();
+                        self.user_data = Some(h);
+                        h
+                    }
+                };
+                let ri = self.s.m.i32(row);
+                let r = self.s.op(
+                    entry,
+                    "cbufferLoadLegacy.i32",
+                    Attr::ReadOnly,
+                    self.s.t.cbuf_ret,
+                    59,
+                    &[h, ri],
+                );
+                self.user_rows.insert(row, r);
+                r
             }
         };
-        let entry = self.s.entry;
-        let row = self.s.m.i32(index / 4);
-        let r = self.s.op(
-            entry,
-            "cbufferLoadLegacy.i32",
-            Attr::ReadOnly,
-            self.s.t.cbuf_ret,
-            59,
-            &[h, row],
-        );
-        self.s.m.extract(entry, r, index % 4)
+        let v = self.s.m.extract(entry, r, index % 4);
+        self.user_vals.insert(index, v);
+        v
     }
 
     /// In a program that uses title memory, the address of the root SRV or
@@ -10724,5 +10744,339 @@ mod tests {
         for a in [1, 3, 4] {
             assert_eq!(param(a), "- - - - - - - -");
         }
+    }
+
+    mod cache_user_data_tests {
+        use super::*;
+
+    struct CbufReport {
+        blocks: usize,
+        /// `(block, row)` for each `dx.op.cbufferLoadLegacy.i32` call.
+        loads: Vec<(usize, u32)>,
+        /// `(block, lane)` for each `extractvalue` of those calls.
+        extracts: Vec<(usize, u32)>,
+    }
+
+    /// Parses the LLVM 3.7 bitcode emitted by `emit::bitcode` inside a DXIL
+    /// container and inspects its `dx.op.cbufferLoadLegacy.i32` calls.
+    fn inspect_cbuf_loads(dxil: &[u8]) -> CbufReport {
+        struct Bits<'a> {
+            data: &'a [u8],
+            pos: usize,
+        }
+        impl Bits<'_> {
+            fn read(&mut self, n: u32) -> u64 {
+                let mut out = 0u64;
+                for i in 0..n {
+                    let bit = (self.data[self.pos / 8] >> (self.pos % 8)) & 1;
+                    out |= u64::from(bit) << i;
+                    self.pos += 1;
+                }
+                out
+            }
+            fn vbr(&mut self, width: u32) -> u64 {
+                let hi = 1u64 << (width - 1);
+                let mut val = 0u64;
+                let mut shift = 0u32;
+                loop {
+                    let chunk = self.read(width);
+                    val |= (chunk & (hi - 1)) << shift;
+                    if chunk & hi == 0 {
+                        return val;
+                    }
+                    shift += width - 1;
+                }
+            }
+            fn align32(&mut self) {
+                self.pos = (self.pos + 31) & !31;
+            }
+            fn enter_subblock(&mut self) -> (u64, u32, usize) {
+                let id = self.vbr(8);
+                let width = self.vbr(4) as u32;
+                self.align32();
+                let words = self.read(32) as usize;
+                (id, width, words)
+            }
+            fn read_record(&mut self, ops: &mut Vec<u64>) -> u64 {
+                let code = self.vbr(6);
+                let count = self.vbr(6) as usize;
+                ops.clear();
+                for _ in 0..count {
+                    ops.push(self.vbr(6));
+                }
+                code
+            }
+        }
+
+        let container = crate::Container::parse(dxil).unwrap();
+        let part = container.part(crate::FourCC::DXIL).unwrap();
+        let bc = &part.data[24..];
+        assert_eq!(&bc[..4], b"BC\xC0\xDE");
+
+        let mut r = Bits { data: bc, pos: 32 };
+        assert_eq!(r.read(2), 1); // ENTER_SUBBLOCK
+        let (mod_id, mod_w, _) = r.enter_subblock();
+        assert_eq!(mod_id, 8); // MODULE_BLOCK
+
+        let mut void_ty: Option<usize> = None;
+        let mut func_ret: Vec<Option<usize>> = Vec::new();
+        let mut globals = 0u32;
+        let mut funcs = 0u32;
+        let mut consts: Vec<Option<i64>> = Vec::new();
+        let mut cbuf_fn: Option<u32> = None;
+        let mut num_blocks = 0usize;
+        let mut cbuf_loads = Vec::new();
+        let mut cbuf_load_ids = std::collections::HashSet::new();
+        let mut cbuf_extracts = Vec::new();
+        let mut ops = Vec::new();
+
+        loop {
+            match r.read(mod_w) {
+                0 => {
+                    r.align32();
+                    break;
+                }
+                3 => match r.read_record(&mut ops) {
+                    7 => globals += 1,
+                    8 => funcs += 1,
+                    _ => {}
+                },
+                1 => {
+                    let (sub_id, sub_w, words) = r.enter_subblock();
+                    match sub_id {
+                        17 => loop {
+                            // TYPE_BLOCK
+                            match r.read(sub_w) {
+                                0 => {
+                                    r.align32();
+                                    break;
+                                }
+                                3 => match r.read_record(&mut ops) {
+                                    1 | 19 => {}
+                                    2 => {
+                                        void_ty = Some(func_ret.len());
+                                        func_ret.push(None);
+                                    }
+                                    21 => func_ret.push(Some(ops[1] as usize)),
+                                    _ => func_ret.push(None),
+                                },
+                                other => panic!("unexpected entry {other} in TYPE_BLOCK"),
+                            }
+                        },
+                        11 => loop {
+                            // CONSTANTS_BLOCK
+                            match r.read(sub_w) {
+                                0 => {
+                                    r.align32();
+                                    break;
+                                }
+                                3 => match r.read_record(&mut ops) {
+                                    1 => {}
+                                    4 => {
+                                        let v = ops[0];
+                                        let s = if v & 1 == 0 {
+                                            (v >> 1) as i64
+                                        } else {
+                                            (v >> 1).wrapping_neg() as i64
+                                        };
+                                        consts.push(Some(s));
+                                    }
+                                    3 | 6 | 7 => consts.push(None),
+                                    other => panic!("unexpected const record {other}"),
+                                },
+                                other => panic!("unexpected entry {other} in CONSTANTS_BLOCK"),
+                            }
+                        },
+                        14 => loop {
+                            // VALUE_SYMTAB_BLOCK
+                            match r.read(sub_w) {
+                                0 => {
+                                    r.align32();
+                                    break;
+                                }
+                                3 => {
+                                    if r.read_record(&mut ops) == 1 {
+                                        let name: String =
+                                            ops[1..].iter().map(|&c| c as u8 as char).collect();
+                                        if name == "dx.op.cbufferLoadLegacy.i32" {
+                                            cbuf_fn = Some(ops[0] as u32);
+                                        }
+                                    }
+                                }
+                                other => {
+                                    panic!("unexpected entry {other} in VALUE_SYMTAB_BLOCK")
+                                }
+                            }
+                        },
+                        12 => {
+                            // FUNCTION_BLOCK
+                            let first_const = globals + funcs;
+                            let mut inst_id = first_const + consts.len() as u32;
+                            let mut block = 0usize;
+                            loop {
+                                match r.read(sub_w) {
+                                    0 => {
+                                        r.align32();
+                                        break;
+                                    }
+                                    3 => match r.read_record(&mut ops) {
+                                        1 => num_blocks = ops[0] as usize,
+                                        10 | 11 => block += 1,
+                                        44 => {}
+                                        26 => {
+                                            let agg = inst_id - ops[0] as u32;
+                                            if cbuf_load_ids.contains(&agg) {
+                                                cbuf_extracts.push((block, ops[1] as u32));
+                                            }
+                                            inst_id += 1;
+                                        }
+                                        34 => {
+                                            let fty = ops[2] as usize;
+                                            let callee = inst_id - ops[3] as u32;
+                                            if Some(callee) == cbuf_fn {
+                                                let row_val = inst_id - ops[6] as u32;
+                                                let row = consts[(row_val - first_const) as usize]
+                                                    .expect("constant CBV row")
+                                                    as u32;
+                                                cbuf_loads.push((block, row));
+                                                cbuf_load_ids.insert(inst_id);
+                                            }
+                                            if func_ret[fty] != void_ty {
+                                                inst_id += 1;
+                                            }
+                                        }
+                                        2 | 3 | 16 | 20 | 28 | 29 | 38 | 43 | 46 => {
+                                            inst_id += 1;
+                                        }
+                                        other => {
+                                            panic!("unexpected instruction record {other}")
+                                        }
+                                    },
+                                    other => {
+                                        panic!("unexpected entry {other} in FUNCTION_BLOCK")
+                                    }
+                                }
+                            }
+                        }
+                        _ => r.pos += words * 32,
+                    }
+                }
+                other => panic!("unexpected entry {other} in MODULE_BLOCK"),
+            }
+        }
+        CbufReport {
+            blocks: num_blocks,
+            loads: cbuf_loads,
+            extracts: cbuf_extracts,
+        }
+    }
+
+    #[test]
+    fn user_data_cbv_rows_and_dwords_are_cached_in_entry_block() {
+        // 1) Direct user SGPRs s0..s7 (8 dwords across CBV rows 0 and 1):
+        // row 0 read in entry block, row 1 first read after a branch along
+        // with repeated reads of row 0.
+        let direct_words = [
+            0x8008_0100u32, // s_add_u32 s8, s0, s1
+            0x8008_0208,    // s_add_u32 s8, s8, s2
+            0x8008_0308,    // s_add_u32 s8, s8, s3
+            0xBF06_8000,    // s_cmp_eq_u32 s0, 0
+            0xBF85_000B,    // s_cbranch_scc1 -> s_endpgm
+            0x8008_0408,    // s_add_u32 s8, s8, s4
+            0x8008_0508,    // s_add_u32 s8, s8, s5
+            0x8008_0608,    // s_add_u32 s8, s8, s6
+            0x8008_0708,    // s_add_u32 s8, s8, s7
+            0x8008_0008,    // s_add_u32 s8, s8, s0 (repeat)
+            0x8008_0108,    // s_add_u32 s8, s8, s1 (repeat)
+            0x8008_0208,    // s_add_u32 s8, s8, s2 (repeat)
+            0x8008_0308,    // s_add_u32 s8, s8, s3 (repeat)
+            0x7E02_0208,    // v_mov_b32 v1, s8
+            0xD834_0000,
+            0x0000_0100,    // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        // 2) Spilled root-signature loads via s[0:1] (8 dwords at indices
+        // 16..24, CBV rows 4 and 5): row 4 loaded in entry block, row 5 first
+        // loaded after a branch, then repeated s_load_dwordx4 / s_load_dwordx2
+        // re-read the same dwords through `user_at` directly.
+        let spilled_words = [
+            0xF408_0100u32,
+            0xFA00_0000,    // s_load_dwordx4 s[4:7], s[0:1], 0x0 (indices 16..20)
+            0x8014_0504,    // s_add_u32 s20, s4, s5
+            0x8014_0614,    // s_add_u32 s20, s20, s6
+            0x8014_0714,    // s_add_u32 s20, s20, s7
+            0xBF06_8004,    // s_cmp_eq_u32 s4, 0
+            0xBF85_0013,    // s_cbranch_scc1 -> s_endpgm
+            0xF408_0200,
+            0xFA00_0010,    // s_load_dwordx4 s[8:11], s[0:1], 0x10 (indices 20..24)
+            0xF408_0300,
+            0xFA00_0000,    // s_load_dwordx4 s[12:15], s[0:1], 0x0 (repeat 16..20)
+            0xF404_0400,
+            0xFA00_0014,    // s_load_dwordx2 s[16:17], s[0:1], 0x14 (repeat 21..23)
+            0x8014_0814,    // s_add_u32 s20, s20, s8
+            0x8014_0914,    // s_add_u32 s20, s20, s9
+            0x8014_0A14,    // s_add_u32 s20, s20, s10
+            0x8014_0B14,    // s_add_u32 s20, s20, s11
+            0x8014_0C14,    // s_add_u32 s20, s20, s12
+            0x8014_0D14,    // s_add_u32 s20, s20, s13
+            0x8014_0E14,    // s_add_u32 s20, s20, s14
+            0x8014_0F14,    // s_add_u32 s20, s20, s15
+            0x8014_1014,    // s_add_u32 s20, s20, s16
+            0x8014_1114,    // s_add_u32 s20, s20, s17
+            0x7E02_0214,    // v_mov_b32 v1, s20
+            0xD834_0000,
+            0x0000_0100,    // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+
+        for (label, words, user_data, expected_rows) in [
+            ("direct", &direct_words[..], 0u8, [0u32, 1]),
+            ("spilled", &spilled_words[..], 16u8, [4u32, 5]),
+        ] {
+            let layout = vec![RootParam {
+                sgprs: 8,
+                ..root(RootType::Constants, user_data, 0)
+            }];
+            let emitted = lower_with(words, layout, vec![]).unwrap();
+            assert_eq!(emitted.user_data.len(), 8, "{label}: 8 distinct dwords");
+
+            let report = inspect_cbuf_loads(&emitted.dxil);
+            assert!(
+                report.blocks >= 3,
+                "{label}: expected multi-block shader, got {} blocks",
+                report.blocks
+            );
+            assert_eq!(
+                report.loads,
+                vec![(0, expected_rows[0]), (0, expected_rows[1])],
+                "{label}: expected 2 entry-block cbufferLoadLegacy.i32 calls"
+            );
+            assert_eq!(
+                report.extracts.len(),
+                8,
+                "{label}: expected 8 cached extractvalue ops, got {:?}",
+                report.extracts
+            );
+            assert!(
+                report.extracts.iter().all(|&(b, _)| b == 0),
+                "{label}: all user-data extracts must live in entry block 0: {:?}",
+                report.extracts
+            );
+
+            #[cfg(windows)]
+            {
+                let path = super::super::super::validator::Validator::default_path();
+                match super::super::super::validator::Validator::load(path.as_deref()) {
+                    Ok(mut v) => v
+                        .validate(&mut emitted.dxil.clone())
+                        .unwrap_or_else(|e| panic!("{label}: dxil.dll rejected shader: {e}")),
+                    Err(e) if std::env::var_os("VICTORY_DXIL").is_some() => {
+                        panic!("{label}: VICTORY_DXIL set but validator failed to load: {e}");
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
     }
 }
