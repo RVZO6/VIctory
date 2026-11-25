@@ -77,19 +77,27 @@ static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None)
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
+    let key = *full.as_bytes();
+    {
+        let shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = shaders.as_ref().and_then(|map| map.get(&key)) {
+            return existing.clone();
+        }
+    }
+    let candidate = Arc::new(Shader::new(stage, bytes, full));
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
-        .or_insert_with(|| Arc::new(Shader::new(stage, bytes)))
+        .entry(key)
+        .or_insert(candidate)
         .clone()
 }
 
 impl Shader {
-    fn new(stage: &'static str, bytes: &[u8]) -> Shader {
+    fn new(stage: &'static str, bytes: &[u8], full: blake3::Hash) -> Shader {
         Shader {
             stage,
-            hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
+            hash: full.to_hex()[..16].to_owned(),
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
@@ -102,6 +110,8 @@ impl Shader {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    /// Whether `host.dxil` declares 64-bit atomics on typed or heap resources (`SFI0`).
+    pub(crate) atomics64: bool,
 }
 
 #[cfg(windows)]
@@ -173,6 +183,22 @@ fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
     (host.and_then(|host| with_resources(container, host)), cached)
 }
 
+/// Whether `dxil` declares 64-bit atomics on typed (`0x0040_0000`) or heap
+/// (`0x1000_0000`) resources in its `SFI0` feature flags.
+#[cfg(windows)]
+fn dxil_atomics64(dxil: &[u8]) -> bool {
+    victory_shader::Container::parse(dxil)
+        .ok()
+        .and_then(|c| {
+            c.part(victory_shader::FourCC::SFI0)?
+                .data
+                .get(..4)?
+                .try_into()
+                .ok()
+        })
+        .is_some_and(|b: [u8; 4]| u32::from_le_bytes(b) & 0x1040_0000 != 0)
+}
+
 #[cfg(windows)]
 fn with_resources(
     container: &[u8],
@@ -194,7 +220,12 @@ fn with_resources(
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    Ok(Translated { host, used })
+    let atomics64 = dxil_atomics64(&host.dxil);
+    Ok(Translated {
+        host,
+        used,
+        atomics64,
+    })
 }
 
 #[repr(C)]
@@ -560,6 +591,19 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+/// Streams formatted text directly into a BLAKE3 hasher without allocating an
+/// intermediate `String`.
+#[cfg(windows)]
+pub(crate) struct Blake3Writer<'a>(pub &'a mut blake3::Hasher);
+
+#[cfg(windows)]
+impl std::fmt::Write for Blake3Writer<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.update(s.as_bytes());
+        Ok(())
+    }
+}
+
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
@@ -604,8 +648,11 @@ impl Prebuild {
     pub unsafe fn graphics(stream: &[u8]) -> Prebuild {
         // Shaders of their own: a pre-build must not keep every container.
         let own = |stage, code: &Bytecode| {
-            // SAFETY: the caller's pointers.
-            code_of(code).map(|b| Arc::new(Shader::new(stage, unsafe { &*b })))
+            code_of(code).map(|b| {
+                // SAFETY: the caller's pointers.
+                let bytes = unsafe { &*b };
+                Arc::new(Shader::new(stage, bytes, blake3::hash(bytes)))
+            })
         };
         let (shaders, graphics) = read_stream(stream, own);
         Prebuild {
@@ -617,7 +664,11 @@ impl Prebuild {
     /// The compute pipeline of a container.
     pub fn compute(container: &[u8]) -> Prebuild {
         Prebuild {
-            shaders: vec![Arc::new(Shader::new("compute", container))],
+            shaders: vec![Arc::new(Shader::new(
+                "compute",
+                container,
+                blake3::hash(container),
+            ))],
             graphics: None,
         }
     }
@@ -854,5 +905,88 @@ mod tests {
         put(&mut stream, 0x1e0, 10 | 2 << 32);
         // SAFETY: as above.
         assert_ne!(unsafe { Prebuild::graphics(&stream) }.key(), title.host.key);
+    }
+
+    #[test]
+    fn shader_deduplicates_and_matches_blake3_prefix() {
+        let a = b"victory-pipeline-shader-dedup-test-payload-a";
+        let b = b"victory-pipeline-shader-dedup-test-payload-b";
+        let s1 = shader("vertex", a);
+        let s2 = shader("vertex", a);
+        let sb = shader("pixel", b);
+
+        assert!(Arc::ptr_eq(&s1, &s2));
+        assert!(!Arc::ptr_eq(&s1, &sb));
+        assert_eq!(s1.hash.len(), 16);
+        assert_eq!(s1.hash, blake3::hash(a).to_hex()[..16]);
+        assert_eq!(sb.hash, blake3::hash(b).to_hex()[..16]);
+        assert_eq!(s1.container, a);
+        assert_eq!(sb.container, b);
+
+        // Concurrent misses on the same fresh bytes converge to one shared `Arc`.
+        let c = b"victory-pipeline-shader-dedup-test-payload-race";
+        let start = std::sync::Barrier::new(8);
+        let results: Vec<Arc<Shader>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let start = &start;
+                    s.spawn(move || {
+                        start.wait();
+                        shader("compute", c)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for r in &results[1..] {
+            assert!(Arc::ptr_eq(&results[0], r));
+        }
+        assert_eq!(results[0].hash, blake3::hash(c).to_hex()[..16]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dxil_atomics64_reads_sfi0_flags() {
+        use victory_shader::FourCC;
+
+        fn dxbc(parts: &[(FourCC, &[u8])]) -> Vec<u8> {
+            let table = 0x20 + 4 * parts.len();
+            let total = table + parts.iter().map(|(_, d)| 8 + d.len()).sum::<usize>();
+            let mut out = Vec::with_capacity(total);
+            out.extend_from_slice(b"DXBC");
+            out.extend_from_slice(&[0; 16]);
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&(total as u32).to_le_bytes());
+            out.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+            let mut offset = table;
+            for (_, d) in parts {
+                out.extend_from_slice(&(offset as u32).to_le_bytes());
+                offset += 8 + d.len();
+            }
+            for (fourcc, d) in parts {
+                out.extend_from_slice(&fourcc.0);
+                out.extend_from_slice(&(d.len() as u32).to_le_bytes());
+                out.extend_from_slice(d);
+            }
+            out
+        }
+
+        let sfi0 = |flags: u32| {
+            let mut payload = [0u8; 8];
+            payload[..4].copy_from_slice(&flags.to_le_bytes());
+            dxbc(&[(FourCC::HASH, &[0; 16]), (FourCC::SFI0, &payload)])
+        };
+
+        assert!(dxil_atomics64(&sfi0(0x1000_0000)));
+        assert!(dxil_atomics64(&sfi0(0x0040_0000)));
+        assert!(dxil_atomics64(&sfi0(0x1040_0000)));
+        assert!(!dxil_atomics64(&sfi0(0x0)));
+        assert!(!dxil_atomics64(&sfi0(!0x1040_0000)));
+        assert!(!dxil_atomics64(&dxbc(&[(FourCC::SFI0, &[0xff, 0xff])])));
+        assert!(!dxil_atomics64(&dxbc(&[(FourCC::HASH, &[0; 16])])));
+        assert!(!dxil_atomics64(&dxbc(&[])));
+        assert!(!dxil_atomics64(b""));
+        assert!(!dxil_atomics64(b"not a dxbc container"));
     }
 }
