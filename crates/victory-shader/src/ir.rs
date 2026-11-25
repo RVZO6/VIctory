@@ -79,13 +79,44 @@ pub enum Exit {
     Indirect,
 }
 
+/// A block's successors (at most two), stored inline without allocating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Succs {
+    to: [usize; 2],
+    len: usize,
+}
+
+impl std::ops::Deref for Succs {
+    type Target = [usize];
+
+    fn deref(&self) -> &[usize] {
+        &self.to[..self.len]
+    }
+}
+
+impl IntoIterator for Succs {
+    type Item = usize;
+    type IntoIter = std::iter::Take<std::array::IntoIter<usize, 2>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.to.into_iter().take(self.len)
+    }
+}
+
 impl Exit {
-    pub fn successors(&self) -> Vec<usize> {
+    pub(crate) fn succs(&self) -> Succs {
         match *self {
-            Exit::Jump(b) => vec![b],
-            Exit::Branch { taken, not_taken } => vec![taken, not_taken],
-            Exit::End | Exit::Indirect => vec![],
+            Exit::Jump(b) => Succs { to: [b, 0], len: 1 },
+            Exit::Branch { taken, not_taken } => Succs {
+                to: [taken, not_taken],
+                len: 2,
+            },
+            Exit::End | Exit::Indirect => Succs { to: [0, 0], len: 0 },
         }
+    }
+
+    pub fn successors(&self) -> Vec<usize> {
+        self.succs().to_vec()
     }
 }
 
@@ -211,12 +242,11 @@ pub fn build_bounded(
         }
         let m0 = m0_max.get(&machine.offset).copied();
         if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs, m0)? {
-            let unset = |regs: Vec<Reg>| regs.into_iter().map(|r| (r, NONE)).collect();
             blocks[b].insts.push(Inst {
                 machine,
                 fields,
-                reads: unset(reads),
-                writes: unset(writes),
+                reads,
+                writes,
             });
         }
     }
@@ -329,9 +359,23 @@ fn contains(set: &RegSet, reg: Reg) -> bool {
 
 /// In [`Reg`] order, which is also index order.
 fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
-    (0..REGS)
-        .filter(|&i| set[i / 64] >> (i % 64) & 1 != 0)
-        .map(reg_at)
+    set.iter().enumerate().flat_map(|(word_idx, &bits)| {
+        let base = word_idx * 64;
+        let mut w = bits;
+        std::iter::from_fn(move || {
+            if w == 0 {
+                return None;
+            }
+            let bit = w.trailing_zeros() as usize;
+            w &= w - 1;
+            let i = base + bit;
+            if i >= REGS {
+                w = 0;
+                return None;
+            }
+            Some(reg_at(i))
+        })
+    })
 }
 
 /// `outs` is sorted by register, and holds every register live out.
@@ -348,7 +392,7 @@ pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
     while let Some(top) = stack.last_mut() {
         let (b, i) = *top;
         top.1 += 1;
-        match blocks[b].exit.successors().get(i) {
+        match blocks[b].exit.succs().get(i) {
             Some(&s) if !seen[s] => {
                 seen[s] = true;
                 stack.push((s, 0));
@@ -370,7 +414,7 @@ fn link(blocks: &mut [Block]) {
         block.preds.clear();
     }
     for b in 0..blocks.len() {
-        for s in blocks[b].exit.successors() {
+        for s in blocks[b].exit.succs() {
             blocks[s].preds.push(b);
         }
     }
@@ -387,7 +431,7 @@ pub(crate) fn irreducible_edge(
     let &entry = order.first()?;
     let idom = idoms(blocks, order, index);
     for &b in order {
-        for s in blocks[b].exit.successors() {
+        for s in blocks[b].exit.succs() {
             if index[s] > index[b] {
                 continue;
             }
@@ -481,7 +525,7 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
             }
             copy[b] = blocks.len() + copied.len();
             copied.push(b);
-            for s in blocks[b].exit.successors() {
+            for s in blocks[b].exit.succs() {
                 if region[s] && s != header {
                     stack.push(s);
                 }
@@ -525,12 +569,14 @@ fn multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec
         let mut seen = vec![false; blocks.len()];
         let mut stack = vec![from];
         while let Some(b) = stack.pop() {
-            let next = if forward {
-                blocks[b].exit.successors()
+            let succs;
+            let next: &[usize] = if forward {
+                succs = blocks[b].exit.succs();
+                &succs
             } else {
-                blocks[b].preds.clone()
+                &blocks[b].preds
             };
-            for n in next {
+            for &n in next {
                 if inside[n] && !seen[n] {
                     seen[n] = true;
                     stack.push(n);
@@ -596,7 +642,7 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
         changed = false;
         for &b in order.iter().rev() {
             let mut out = empty;
-            for s in blocks[b].exit.successors() {
+            for s in blocks[b].exit.succs() {
                 for (o, i) in out.iter_mut().zip(&live_in[s]) {
                     *o |= i;
                 }
@@ -700,8 +746,8 @@ const DROPPED: &[&str] = &[
     "v_clrexcp",
 ];
 
-/// Registers read, registers written.
-type Effects = (Vec<Reg>, Vec<Reg>);
+/// Registers read, registers written (with placeholder [`NONE`] values before renaming).
+type Effects = (Vec<(Reg, Value)>, Vec<(Reg, Value)>);
 
 /// Registers an instruction reads and writes, one per dword, or `None` if
 /// the IR drops it.
@@ -720,9 +766,9 @@ fn effects(
         offset: inst.offset,
         what: name,
     };
-    let mask = |code: u8| (0..lanes).map(move |i| Reg::S(code + i));
+    let mask = |code: u8| (0..lanes).map(move |i| (Reg::S(code + i), NONE));
     let (mut r, mut w) = (Vec::new(), Vec::new());
-    let regs = |op: &Operand, out: &mut Vec<Reg>| {
+    let regs = |op: &Operand, out: &mut Vec<(Reg, Value)>| {
         add_regs(op, lanes, out).map_err(|_| ShaderError::Isa {
             offset: inst.offset,
             reason: "register range out of bounds",
@@ -757,21 +803,21 @@ fn effects(
                 || name.starts_with("s_cselect_")
                 || name.starts_with("s_cmov_")
             {
-                r.push(Reg::Scc);
+                r.push((Reg::Scc, NONE));
             }
             if name.contains("saveexec") || name.contains("wrexec") {
                 r.extend(mask(EXEC));
                 w.extend(mask(EXEC));
             }
             if writes_scc(inst.encoding, name) {
-                w.push(Reg::Scc);
+                w.push((Reg::Scc, NONE));
             }
         }
         Fields::Sopp { .. } => match name {
-            "s_cbranch_scc0" | "s_cbranch_scc1" => r.push(Reg::Scc),
+            "s_cbranch_scc0" | "s_cbranch_scc1" => r.push((Reg::Scc, NONE)),
             "s_cbranch_vccz" | "s_cbranch_vccnz" => r.extend(mask(VCC)),
             "s_cbranch_execz" | "s_cbranch_execnz" => r.extend(mask(EXEC)),
-            "s_sendmsg" | "s_sendmsghalt" => r.push(Reg::S(M0)),
+            "s_sendmsg" | "s_sendmsghalt" => r.push((Reg::S(M0), NONE)),
             "s_endpgm"
             | "s_endpgm_saved"
             | "s_endpgm_ordered_ps_done"
@@ -818,10 +864,10 @@ fn effects(
             };
             // v[reg + M0] for any M0 that stays inside the program's VGPRs
             // (and below the proven bound).
-            let indexed = |op: &Operand, out: &mut Vec<Reg>| match *op {
+            let indexed = |op: &Operand, out: &mut Vec<(Reg, Value)>| match *op {
                 Operand::Vector { reg, .. } if u16::from(reg) < vgprs => {
                     let end = m0_max.map_or(vgprs, |m| vgprs.min(u16::from(reg) + u16::from(m) + 1));
-                    out.extend((u16::from(reg)..end).map(|r| Reg::V(r as u8)));
+                    out.extend((u16::from(reg)..end).map(|r| (Reg::V(r as u8), NONE)));
                     Ok(())
                 }
                 _ => Err(ShaderError::Isa {
@@ -865,12 +911,12 @@ fn effects(
                 _ => {}
             }
             if name.starts_with("v_interp_") || src_indexed || dst_indexed {
-                r.push(Reg::S(M0));
+                r.push((Reg::S(M0), NONE));
             }
         }
         Fields::Vintrp { dst, src, .. } => {
             regs(src, &mut r)?;
-            r.push(Reg::S(M0));
+            r.push((Reg::S(M0), NONE));
             regs(dst, &mut w)?;
         }
         Fields::Ds {
@@ -891,7 +937,7 @@ fn effects(
                 || name.contains("addtid")
                 || matches!(name, "ds_ordered_count" | "ds_append" | "ds_consume")
             {
-                r.push(Reg::S(M0));
+                r.push((Reg::S(M0), NONE));
             }
         }
         Fields::Buffer {
@@ -911,7 +957,7 @@ fn effects(
             regs(rsrc, &mut r)?;
             regs(soffset, &mut r)?;
             if *lds {
-                r.push(Reg::S(M0));
+                r.push((Reg::S(M0), NONE));
             }
             if let Some(d) = data {
                 if name.contains("_load_") {
@@ -975,12 +1021,14 @@ fn effects(
     if vector {
         r.extend(mask(EXEC));
         // Lanes disabled in EXEC keep the old value.
-        r.extend(w.iter().filter(|w| matches!(w, Reg::V(_))));
+        r.extend(w.iter().filter(|&&(reg, _)| matches!(reg, Reg::V(_))).copied());
     }
-    let mut seen = Vec::with_capacity(r.len());
-    r.retain(|reg| {
-        let new = !seen.contains(reg);
-        seen.push(*reg);
+    let mut seen: RegSet = [0; REGS.div_ceil(64)];
+    r.retain(|&(reg, _)| {
+        let new = !contains(&seen, reg);
+        if new {
+            insert(&mut seen, reg);
+        }
         new
     });
     Ok(Some((r, w)))
@@ -1047,7 +1095,7 @@ fn atomic_result(data: &Operand, name: &str) -> Operand {
 
 /// Appends the register dwords an operand names; reading `vccz`, `execz`,
 /// `scc` or `lds_direct` reads the register behind it.
-fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
+fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<(Reg, Value)>) -> Result<(), ()> {
     match *op {
         Operand::Scalar { code, .. } if code == gfx10::NULL => {}
         Operand::Scalar { code, dwords } => {
@@ -1055,18 +1103,18 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
             if end > 128 {
                 return Err(());
             }
-            out.extend((code..end as u8).map(Reg::S));
+            out.extend((code..end as u8).map(|r| (Reg::S(r), NONE)));
         }
         Operand::Vector { reg, dwords } => {
             if u16::from(reg) + u16::from(dwords) > 256 {
                 return Err(());
             }
-            out.extend((0..dwords).map(|i| Reg::V(reg + i)));
+            out.extend((0..dwords).map(|i| (Reg::V(reg + i), NONE)));
         }
-        Operand::Const(251) => out.extend((0..lanes).map(|i| Reg::S(VCC + i))),
-        Operand::Const(252) => out.extend((0..lanes).map(|i| Reg::S(EXEC + i))),
-        Operand::Const(253) => out.push(Reg::Scc),
-        Operand::Const(254) => out.push(Reg::S(M0)),
+        Operand::Const(251) => out.extend((0..lanes).map(|i| (Reg::S(VCC + i), NONE))),
+        Operand::Const(252) => out.extend((0..lanes).map(|i| (Reg::S(EXEC + i), NONE))),
+        Operand::Const(253) => out.push((Reg::Scc, NONE)),
+        Operand::Const(254) => out.push((Reg::S(M0), NONE)),
         Operand::Const(_) | Operand::Literal(_) | Operand::Attr { .. } => {}
     }
     Ok(())
@@ -1467,5 +1515,161 @@ mod tests {
         assert_eq!(header.insts[0].read(Reg::S(2)), Some(lp_s2));
         assert_eq!(exit.insts[0].read(Reg::S(1)), Some(next_s1));
         assert_eq!(exit.insts[0].read(Reg::S(2)), Some(lp_s2));
+    }
+
+    #[test]
+    fn exit_succs_matches_successors() {
+        for exit in [
+            Exit::End,
+            Exit::Indirect,
+            Exit::Jump(7),
+            Exit::Branch {
+                taken: 3,
+                not_taken: 5,
+            },
+        ] {
+            let s = exit.succs();
+            assert_eq!(&*s, &exit.successors()[..]);
+            assert_eq!(s.into_iter().collect::<Vec<_>>(), exit.successors());
+        }
+    }
+
+    #[test]
+    fn members_bit_scan_matches_linear_scan() {
+        let linear = |set: &RegSet| -> Vec<Reg> {
+            (0..REGS)
+                .filter(|&i| set[i / 64] >> (i % 64) & 1 != 0)
+                .map(reg_at)
+                .collect()
+        };
+        let empty: RegSet = [0; REGS.div_ceil(64)];
+        assert_eq!(members(&empty).collect::<Vec<_>>(), Vec::<Reg>::new());
+
+        // Edge registers across every 64-bit word boundary plus highest bit.
+        let mut edges = empty;
+        for reg in [
+            Reg::S(0),
+            Reg::S(63),
+            Reg::S(64),
+            Reg::S(127),
+            Reg::Scc,
+            Reg::V(0),
+            Reg::V(62),
+            Reg::V(63),
+            Reg::V(127),
+            Reg::V(255),
+        ] {
+            insert(&mut edges, reg);
+        }
+        assert_eq!(members(&edges).collect::<Vec<_>>(), linear(&edges));
+
+        // All bits set (including padding bits past REGS in the final word).
+        let all: RegSet = [u64::MAX; REGS.div_ceil(64)];
+        let got: Vec<Reg> = members(&all).collect();
+        assert_eq!(got.len(), REGS);
+        assert_eq!(got, linear(&all));
+
+        // Deterministic sparse and dense patterns.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        for _ in 0..64 {
+            let mut set = empty;
+            for w in &mut set {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *w = state;
+            }
+            assert_eq!(members(&set).collect::<Vec<_>>(), linear(&set));
+        }
+    }
+
+    #[test]
+    fn effects_dedup_preserves_first_occurrence_order() {
+        // v_add_f32 v0, v0, v0: src0=v0, src1=v0, implicit EXEC, old dst v0 -> [v0, EXEC].
+        // v_movreld_b32 v2, v2: src=v2, M0, EXEC, old dst v2..v6 -> [v2, M0, EXEC, v3, v4, v5].
+        let code: Vec<u8> = [
+            0x0600_0100_u32, // v_add_f32 v0, v0, v0
+            0x7E04_8502,     // v_movreld_b32 v2, v2
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = build(&code, false, 6).unwrap();
+        let [add, movreld, _] = &p.blocks[0].insts[..] else {
+            panic!()
+        };
+        let read_regs = |inst: &Inst| -> Vec<Reg> { inst.reads.iter().map(|&(r, _)| r).collect() };
+        assert_eq!(read_regs(add), [Reg::V(0), Reg::S(EXEC)]);
+        assert_eq!(
+            read_regs(movreld),
+            [
+                Reg::V(2),
+                Reg::S(M0),
+                Reg::S(EXEC),
+                Reg::V(3),
+                Reg::V(4),
+                Reg::V(5),
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_ir_build() {
+        // 1. VALU + CFG loop shader (~2048 VALU ops across 64 diamond blocks + backedge).
+        let mut valu_cfg = vec![0xBE81_0381_u32, 0xBE82_0382]; // s_mov_b32 s1/s2
+        let loop_start = valu_cfg.len();
+        for b in 0..64u32 {
+            valu_cfg.push(0xBF06_0201); // s_cmp_eq_u32 s1, s2
+            valu_cfg.push(s_cbranch_scc1(16));
+            for i in 0..16u32 {
+                let dst = (i + b) & 31;
+                let src0 = 256 + ((i + 1) & 31);
+                let src1 = (i + 2) & 31;
+                // v_add_f32 v[dst], v[src0-256], v[src1] (VOP2 opcode 0x03)
+                valu_cfg.push((0x03 << 25) | (dst << 17) | (src1 << 9) | src0);
+            }
+            for i in 0..16u32 {
+                let dst = (i + b + 3) & 31;
+                let src0 = 256 + ((i + 4) & 31);
+                // v_cvt_f32_i32 v[dst], v[src0-256] (VOP1 opcode 0x05)
+                valu_cfg.push(0x7E00_0000 | (dst << 17) | (0x05 << 9) | src0);
+            }
+        }
+        valu_cfg.push(0xBF07_8401); // s_cmp_lg_u32 s1, 4
+        let back = -((valu_cfg.len() - loop_start + 1) as i16);
+        valu_cfg.push(s_cbranch_scc1(back));
+        valu_cfg.push(S_ENDPGM);
+        let valu_bytes: Vec<u8> = valu_cfg.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+        // 2. Relative VGPR shader (64 x v_movreld_b32 / v_movrels_b32 with 128 VGPRs).
+        let mut movrel = Vec::new();
+        for i in 0..32u32 {
+            movrel.push(0x7E00_8501 | ((i & 7) << 17)); // v_movreld_b32
+            movrel.push(0x7E00_8700 | ((i & 7) << 17) | (i & 7)); // v_movrels_b32
+        }
+        movrel.push(S_ENDPGM);
+        let movrel_bytes: Vec<u8> = movrel.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+        let _ = std::hint::black_box(build(&valu_bytes, false, 64).unwrap());
+        let _ = std::hint::black_box(build(&movrel_bytes, false, 128).unwrap());
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..200 {
+            let p = build(std::hint::black_box(&valu_bytes), false, 64).unwrap();
+            std::hint::black_box(p.blocks.len());
+        }
+        let valu_us = t0.elapsed().as_secs_f64() * 1e6 / 200.0;
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..200 {
+            let p = build(std::hint::black_box(&movrel_bytes), false, 128).unwrap();
+            std::hint::black_box(p.blocks.len());
+        }
+        let movrel_us = t1.elapsed().as_secs_f64() * 1e6 / 200.0;
+
+        eprintln!("ir::build valu_cfg(2048 insts, 128 blks): {valu_us:.1} us/run");
+        eprintln!("ir::build movrel(64 insts, 128 vgprs):    {movrel_us:.1} us/run");
     }
 }
