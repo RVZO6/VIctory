@@ -231,11 +231,38 @@ pub(crate) fn note_prebuilt(key: String) {
 /// A pipeline's name in the library: the hash of what its host
 /// description holds.
 pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> String {
+    name_with(kind, root, code, |out| out.write_str(state))
+}
+
+/// A pipeline's name in the library, streaming its state description into the
+/// hasher with no intermediate `String` allocation while keeping the exact
+/// length-prefixed hash layout of [`name`].
+pub(crate) fn name_with(
+    kind: &str,
+    root: &[u8],
+    code: &[&[u8]],
+    write_state: impl Fn(&mut dyn std::fmt::Write) -> std::fmt::Result,
+) -> String {
+    struct Len(u64);
+    impl std::fmt::Write for Len {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0 += s.len() as u64;
+            Ok(())
+        }
+    }
+
     let mut h = blake3::Hasher::new();
-    for part in [kind.as_bytes(), root].into_iter().chain(code.iter().copied()).chain([state.as_bytes()]) {
+    for part in [kind.as_bytes(), root]
+        .into_iter()
+        .chain(code.iter().copied())
+    {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(part);
     }
+    let mut len = Len(0);
+    let _ = write_state(&mut len);
+    h.update(&len.0.to_le_bytes());
+    let _ = write_state(&mut super::Blake3Writer(&mut h));
     h.finalize().to_hex()[..32].to_owned()
 }
 
@@ -327,7 +354,16 @@ pub(crate) fn save(now: bool) {
             }
         }
     };
-    let used = USED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Used::list).unwrap_or_default();
+    let used = EARLY_BEFORE
+        .get()
+        .map(|before| {
+            let now = USED_NOW.lock().unwrap_or_else(|e| e.into_inner());
+            match now.as_ref() {
+                Some(now) => early_list(before, now),
+                None => early_list(before, &KeySet::default()),
+            }
+        })
+        .unwrap_or_default();
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
@@ -373,70 +409,159 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     res
 }
 
+/// Parses a canonical 32-character lowercase hexadecimal pipeline key as `u128`.
+/// Non-canonical keys (different length, uppercase, sign, non-hex) return `None`
+/// and fall back to exact string storage so semantics and round-tripping stay identical.
+fn parse_key_u128(key: &str) -> Option<u128> {
+    (key.len() == 32 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .then(|| u128::from_str_radix(key, 16).ok())
+        .flatten()
+}
+
+/// Compact set of pipeline keys: canonical 32-hex keys live in `HashSet<u128>`
+/// with zero per-key heap `String` allocations; any non-32-hex line falls back
+/// to `other`.
+#[derive(Default)]
+struct KeySet {
+    hex: HashSet<u128>,
+    other: Vec<String>,
+}
+
+impl KeySet {
+    fn from_lines(text: &str) -> Self {
+        let mut set = Self::default();
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            set.insert(line);
+        }
+        set
+    }
+
+    fn insert(&mut self, key: &str) -> bool {
+        if let Some(id) = parse_key_u128(key) {
+            self.hex.insert(id)
+        } else if self.other.iter().any(|s| s == key) {
+            false
+        } else {
+            self.other.push(key.to_owned());
+            true
+        }
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        if let Some(id) = parse_key_u128(key) {
+            self.hex.contains(&id)
+        } else {
+            self.other.iter().any(|s| s == key)
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.hex.len() + self.other.len()
+    }
+}
+
 /// Title pipelines created, and their distinct keys.
-static CREATED: Mutex<(u64, Option<HashSet<String>>)> = Mutex::new((0, None));
+#[derive(Default)]
+struct Created {
+    total: u64,
+    distinct: KeySet,
+}
+
+impl Created {
+    fn record(&mut self, key: &str) {
+        self.total += 1;
+        self.distinct.insert(key);
+    }
+
+    fn counts(&self) -> (u64, usize) {
+        (self.total, self.distinct.len())
+    }
+}
+
+static CREATED: Mutex<Option<Created>> = Mutex::new(None);
 
 /// The title created a pipeline with `key`.
 pub(crate) fn note_created(key: &str) {
     let mut created = CREATED.lock().unwrap_or_else(|e| e.into_inner());
-    created.0 += 1;
-    created.1.get_or_insert_with(HashSet::new).insert(key.to_owned());
+    created.get_or_insert_with(Created::default).record(key);
 }
 
 /// Title pipelines created so far, and how many distinct ones.
 fn created() -> (u64, usize) {
     let created = CREATED.lock().unwrap_or_else(|e| e.into_inner());
-    (created.0, created.1.as_ref().map_or(0, HashSet::len))
+    created.as_ref().map_or((0, 0), Created::counts)
 }
 
-/// Title pipeline keys drawn or dispatched with: in earlier runs (the
-/// list as loaded), and in this one.
-#[derive(Default)]
-struct Used {
-    before: HashSet<String>,
-    now: HashSet<String>,
-}
-
-impl Used {
-    /// The list to keep: this run's keys, then earlier runs' others, at
-    /// most `EARLY_MAX` (the oldest go once it is full).
-    fn list(&self) -> Vec<String> {
-        let earlier = self.before.iter().filter(|k| !self.now.contains(*k));
-        self.now.iter().chain(earlier).take(EARLY_MAX).cloned().collect()
+/// The list to keep: this run's keys, then earlier runs' others, at most
+/// `EARLY_MAX` (the oldest go once it is full).
+fn early_list(before: &KeySet, now: &KeySet) -> Vec<String> {
+    let mut out = Vec::with_capacity((now.len() + before.len()).min(EARLY_MAX));
+    for &id in &now.hex {
+        if out.len() == EARLY_MAX {
+            return out;
+        }
+        out.push(format!("{id:032x}"));
     }
+    for key in &now.other {
+        if out.len() == EARLY_MAX {
+            return out;
+        }
+        out.push(key.clone());
+    }
+    for &id in &before.hex {
+        if out.len() == EARLY_MAX {
+            return out;
+        }
+        if !now.hex.contains(&id) {
+            out.push(format!("{id:032x}"));
+        }
+    }
+    for key in &before.other {
+        if out.len() == EARLY_MAX {
+            return out;
+        }
+        if !now.other.iter().any(|k| k == key) {
+            out.push(key.clone());
+        }
+    }
+    out
 }
 
-static USED: Mutex<Option<Used>> = Mutex::new(None);
+/// Earlier runs' early-start keys, loaded once so [`wanted_early`] is lock-free.
+static EARLY_BEFORE: OnceLock<KeySet> = OnceLock::new();
+/// Title pipeline keys drawn or dispatched with in this run.
+static USED_NOW: Mutex<Option<KeySet>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn used() -> std::sync::MutexGuard<'static, Option<Used>> {
-    let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
-    if used.is_none() {
-        let listed = DIR
-            .get()
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
-            .unwrap_or_default();
-        let before: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        tracing::info!(pipelines = before.len(), "title pipelines to start early");
-        *used = Some(Used { before, now: HashSet::new() });
-    }
-    used
+fn load_early_before(dir: Option<&std::path::Path>) -> KeySet {
+    let listed = dir
+        .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
+        .unwrap_or_default();
+    let before = KeySet::from_lines(&listed);
+    tracing::info!(pipelines = before.len(), "title pipelines to start early");
+    before
+}
+
+fn early_before() -> &'static KeySet {
+    EARLY_BEFORE.get_or_init(|| load_early_before(DIR.get().map(PathBuf::as_path)))
 }
 
 /// Reads the early list now if not yet, so a save keeps it (a pre-build
 /// asks for no title pipeline).
 pub(crate) fn keep_early_list() {
-    drop(used());
+    let _ = early_before();
 }
 
 /// Whether the title pipeline with `key` was drawn with in an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
-    used().as_ref().is_some_and(|u| u.before.contains(key))
+    early_before().contains(key)
 }
 
 /// The title pipeline with `key` was drawn or dispatched with.
 pub(crate) fn note_used(key: &str) {
-    if used().get_or_insert_with(Used::default).now.insert(key.to_owned()) {
+    let _ = early_before();
+    let mut now = USED_NOW.lock().unwrap_or_else(|e| e.into_inner());
+    if now.get_or_insert_with(KeySet::default).insert(key) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -460,11 +585,18 @@ mod tests {
     /// This run's keys stay in the list; earlier runs' fill it up to the cap.
     #[test]
     fn the_early_list_keeps_this_run_first() {
-        let keys = |r: std::ops::Range<usize>| r.map(|i| format!("{i:032x}")).collect::<HashSet<_>>();
-        let used = Used { before: keys(0..EARLY_MAX), now: keys(EARLY_MAX - 10..EARLY_MAX + 10) };
-        let list = used.list();
+        let keys = |r: std::ops::Range<usize>| {
+            let mut set = KeySet::default();
+            for i in r {
+                set.insert(&format!("{i:032x}"));
+            }
+            set
+        };
+        let before = keys(0..EARLY_MAX);
+        let now = keys(EARLY_MAX - 10..EARLY_MAX + 10);
+        let list = early_list(&before, &now);
         assert_eq!(list.len(), EARLY_MAX);
-        assert!(used.now.iter().all(|k| list.contains(k)));
+        assert!((EARLY_MAX - 10..EARLY_MAX + 10).all(|i| list.contains(&format!("{i:032x}"))));
         assert_eq!(list.iter().collect::<HashSet<_>>().len(), EARLY_MAX, "no key twice");
     }
 
@@ -649,6 +781,110 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());
+    }
+
+    #[test]
+    fn parse_key_u128_accepts_only_canonical_32_hex() {
+        assert_eq!(
+            parse_key_u128("00000000000000000000000000000000"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_key_u128("ffffffffffffffffffffffffffffffff"),
+            Some(u128::MAX)
+        );
+        assert_eq!(
+            parse_key_u128("0123456789abcdef0123456789abcdef"),
+            Some(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef)
+        );
+        for non_canonical in [
+            "",
+            "deadbeef",
+            "0123456789abcdef0123456789abcde",   // 31 chars
+            "0123456789abcdef0123456789abcdef0", // 33 chars
+            "0123456789ABCDEF0123456789ABCDEF",  // uppercase
+            "+0123456789abcdef0123456789abcde",  // leading +
+            "-0123456789abcdef0123456789abcde",  // leading -
+            " 0123456789abcdef0123456789abcde",  // leading space
+            "0123456789abcdef0123456789abcdeg",  // non-hex char
+        ] {
+            assert_eq!(parse_key_u128(non_canonical), None, "{non_canonical:?}");
+        }
+    }
+
+    #[test]
+    fn created_deduplicates_hex_and_non_hex_keys() {
+        let mut created = Created::default();
+        assert_eq!(created.counts(), (0, 0));
+
+        let k1 = "0123456789abcdef0123456789abcdef";
+        let k2 = "fedcba9876543210fedcba9876543210";
+        let upper = "0123456789ABCDEF0123456789ABCDEF";
+        let plus = "+0000000000000000000000000000001";
+        let custom = "legacy-non-hex-key";
+
+        for k in [k1, k1, k2, upper, upper, plus, custom, custom, k2] {
+            created.record(k);
+        }
+        assert_eq!(created.counts(), (9, 5));
+        assert_eq!(created.distinct.hex.len(), 2);
+        assert_eq!(created.distinct.other.len(), 3);
+    }
+
+    #[test]
+    fn early_before_lock_free_lookup_handles_hex_and_non_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let hex_a = "00000000000000000000000000000001";
+        let hex_b = "abcdef0123456789abcdef0123456789";
+        let hex_missing = "abcdef0123456789abcdef0123456780";
+        let upper = "ABCDEF0123456789ABCDEF0123456789";
+        let plus = "+0000000000000000000000000000001";
+        let non_hex = "custom-pipeline-key";
+
+        let content = format!(
+            "\n{hex_a}\n{hex_b}\n{hex_a}\n\n{upper}\n{plus}\n{non_hex}\n{non_hex}\n"
+        );
+        std::fs::write(dir.path().join(EARLY_FILE), content).unwrap();
+
+        let cell: OnceLock<KeySet> = OnceLock::new();
+        let loaded = cell.get_or_init(|| load_early_before(Some(dir.path())));
+        assert_eq!(loaded.hex.len(), 2);
+        assert_eq!(loaded.other.len(), 3);
+        assert_eq!(loaded.len(), 5);
+
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    let before = cell.get().unwrap();
+                    assert!(before.contains(hex_a));
+                    assert!(before.contains(hex_b));
+                    assert!(!before.contains(hex_missing));
+                    assert!(before.contains(upper));
+                    assert!(before.contains(plus));
+                    assert!(before.contains(non_hex));
+                    assert!(!before.contains("00000000000000000000000000000002"));
+                    assert!(!before.contains("other-missing"));
+                });
+            }
+        });
+
+        // Missing directory / file loads cleanly as empty.
+        assert_eq!(load_early_before(None).len(), 0);
+        let empty_dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_early_before(Some(empty_dir.path())).len(), 0);
+
+        // `early_list` merges both hex and fallback keys with `now` first and no duplicates.
+        let mut now = KeySet::default();
+        now.insert(hex_b);
+        now.insert(hex_missing);
+        now.insert(non_hex);
+        now.insert("new-custom");
+        let merged = early_list(loaded, &now);
+        assert_eq!(merged.len(), 7);
+        assert_eq!(merged.iter().collect::<HashSet<_>>().len(), 7);
+        for expected in [hex_a, hex_b, hex_missing, upper, plus, non_hex, "new-custom"] {
+            assert!(merged.iter().any(|k| k == expected), "missing {expected}");
+        }
     }
 
     #[test]

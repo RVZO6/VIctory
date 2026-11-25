@@ -10,7 +10,7 @@
 //! `crate::watch`).
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::{Arc, Mutex};
 
 use crate::descriptor::View;
@@ -20,9 +20,9 @@ use crate::shadow::Shadow;
 
 /// What a title heap slot views that title memory feeds.
 #[derive(Clone)]
-enum Seen {
+enum Seen<S = Shadow> {
     /// `len` bytes at `address` of a buffer's host copy; unordered access.
-    Buffer(Arc<Shadow>, u64, u64, bool),
+    Buffer(Arc<S>, u64, u64, bool),
     /// A title texture (resource object) whose contents the title writes.
     Texture(usize),
     /// A view left without a host view (textures the title placed itself),
@@ -36,34 +36,57 @@ const KINDS: [&str; 4] = ["buffer", "unordered buffer", "placed texture", "other
 
 /// A heap's slots that view title memory, and the distinct buffer ranges
 /// and textures among them (with how many slots view each).
-#[derive(Default)]
-pub(crate) struct Viewed {
-    inner: Mutex<Inner>,
+pub(crate) struct Viewed<S = Shadow> {
+    inner: Mutex<Inner<S>>,
+    /// Bumped under `inner` whenever a distinct buffer range comes or goes,
+    /// so a submission batch refreshes a heap again only when its hulls may
+    /// have changed.
+    generation: AtomicU64,
+}
+
+impl<S> Default for Viewed<S> {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::default(),
+            generation: AtomicU64::new(0),
+        }
+    }
 }
 
 type Range = (usize, u64, u64, bool);
 
 /// A merged range: copy, start, bytes, unordered access.
-type Hull = (Arc<Shadow>, u64, u64, bool);
+type Hull<S = Shadow> = (Arc<S>, u64, u64, bool);
 
-#[derive(Default)]
-struct Inner {
-    slots: HashMap<u32, Seen>,
-    ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
+struct Inner<S = Shadow> {
+    slots: HashMap<u32, Seen<S>>,
+    ranges: BTreeMap<Range, (u32, Arc<S>)>,
     textures: BTreeMap<usize, u32>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), while no
     /// range is added or dropped: every list running heap shaders asks.
-    hulls: Option<Vec<Hull>>,
+    hulls: Option<Arc<[Hull<S>]>>,
     /// Per copy and kind (unordered access): the copy, and how many ranges
     /// start and end at each offset, so that the hulls are made from the
     /// copies, not from every range (the title rewrites slots between most
     /// lists, and remerging the world's 130,000 ranges each time cost 0.15
     /// s per frame).
-    ends: HashMap<(usize, bool), Ends>,
+    ends: HashMap<(usize, bool), Ends<S>>,
+}
+
+impl<S> Default for Inner<S> {
+    fn default() -> Self {
+        Self {
+            slots: HashMap::new(),
+            ranges: BTreeMap::new(),
+            textures: BTreeMap::new(),
+            hulls: None,
+            ends: HashMap::new(),
+        }
+    }
 }
 
 /// A copy, and the counts of its ranges' starts and ends.
-type Ends = (Arc<Shadow>, BTreeMap<u64, u32>, BTreeMap<u64, u32>);
+type Ends<S = Shadow> = (Arc<S>, BTreeMap<u64, u32>, BTreeMap<u64, u32>);
 
 /// One more (`add`) or one fewer of `at` in `counts`.
 fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
@@ -74,8 +97,8 @@ fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
     }
 }
 
-impl Inner {
-    fn count(&mut self, seen: &Seen, add: bool) {
+impl<S> Inner<S> {
+    fn count(&mut self, seen: &Seen<S>, add: bool) -> bool {
         let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
         match seen {
             Seen::Buffer(shadow, address, len, uav) => {
@@ -99,6 +122,7 @@ impl Inner {
                     if ends.1.is_empty() {
                         self.ends.remove(&(key.0, key.3));
                     }
+                    return true;
                 }
             }
             Seen::Texture(r) => {
@@ -110,6 +134,7 @@ impl Inner {
             }
             Seen::Left(_) => {}
         }
+        false
     }
 }
 
@@ -118,24 +143,40 @@ impl Viewed {
     /// host (`made`) or left without a host view.
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
         let seen = view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) });
+        self.set_seen(index, seen);
+    }
+}
+
+impl<S> Viewed<S> {
+    fn set_seen(&self, index: u32, seen: Option<Seen<S>>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut changed = false;
         if let Some(old) = inner.slots.remove(&index) {
-            inner.count(&old, false);
+            changed |= inner.count(&old, false);
         }
         if let Some(seen) = seen {
-            inner.count(&seen, true);
+            changed |= inner.count(&seen, true);
             inner.slots.insert(index, seen);
         }
+        if changed {
+            self.generation.fetch_add(1, Release);
+        }
+    }
+
+    /// Monotonic generation of this heap's merged buffer hulls: read before
+    /// [`refresh`].
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Acquire)
     }
 
     /// The buffer ranges views reach, merged per host copy and kind
     /// (shader resource, unordered access): copy, start, bytes.
-    fn ranges(&self) -> Vec<Hull> {
+    fn ranges(&self) -> Arc<[Hull<S>]> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(hulls) = &inner.hulls {
-            return hulls.clone();
+            return Arc::clone(hulls);
         }
-        let hulls: Vec<Hull> = inner
+        let hulls: Arc<[Hull<S>]> = inner
             .ends
             .iter()
             .filter_map(|(&(_, uav), (shadow, starts, ends))| {
@@ -143,7 +184,7 @@ impl Viewed {
                 Some((shadow.clone(), from, to - from, uav))
             })
             .collect();
-        inner.hulls = Some(hulls.clone());
+        inner.hulls = Some(Arc::clone(&hulls));
         hulls
     }
 }
@@ -253,8 +294,8 @@ impl Uploads {
 /// (about 1 GB of them in the world) cost seconds per frame; the upgrade
 /// is shaders marking the pages they write (as `crate::memory` does).
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
-    for (shadow, address, len, _) in viewed.ranges() {
-        add(&shadow, address as usize, len as usize);
+    for (shadow, address, len, _) in viewed.ranges().iter() {
+        add(shadow, *address as usize, *len as usize);
     }
 }
 
@@ -503,6 +544,69 @@ void main(uint3 id : SV_DispatchThreadID) {
         set(2, None);
         assert!(hull().is_empty());
         crate::shadow::unregister(at as usize, at);
+    }
+
+    /// Repeated `Viewed::ranges()` calls return the same cached `Arc<[Hull]>`
+    /// (and keep the generation steady) until a distinct buffer range is added
+    /// or removed.
+    #[test]
+    fn viewed_ranges_reuses_arc_until_mutated() {
+        let viewed: Viewed<()> = Viewed::default();
+        let copy = Arc::new(());
+        let g0 = viewed.generation();
+        let empty1 = viewed.ranges();
+        let empty2 = viewed.ranges();
+        assert!(empty1.is_empty());
+        assert!(Arc::ptr_eq(&empty1, &empty2));
+        assert_eq!(viewed.generation(), g0);
+
+        viewed.set_seen(0, Some(Seen::Buffer(copy.clone(), 0x100, 0x100, false)));
+        let g1 = viewed.generation();
+        assert!(g1 > g0);
+        let one1 = viewed.ranges();
+        let one2 = viewed.ranges();
+        assert!(!Arc::ptr_eq(&empty1, &one1));
+        assert!(Arc::ptr_eq(&one1, &one2));
+        assert_eq!(one1.len(), 1);
+        assert_eq!((one1[0].1, one1[0].2, one1[0].3), (0x100, 0x100, false));
+
+        // A second slot viewing the exact same range does not invalidate the cache.
+        viewed.set_seen(1, Some(Seen::Buffer(copy.clone(), 0x100, 0x100, false)));
+        assert_eq!(viewed.generation(), g1);
+        assert!(Arc::ptr_eq(&one1, &viewed.ranges()));
+
+        // A distinct range expands the hull and replaces the cached Arc.
+        viewed.set_seen(2, Some(Seen::Buffer(copy.clone(), 0x800, 0x200, false)));
+        let g2 = viewed.generation();
+        assert!(g2 > g1);
+        let grown1 = viewed.ranges();
+        let grown2 = viewed.ranges();
+        assert!(!Arc::ptr_eq(&one1, &grown1));
+        assert!(Arc::ptr_eq(&grown1, &grown2));
+        assert_eq!(grown1.len(), 1);
+        assert_eq!((grown1[0].1, grown1[0].2, grown1[0].3), (0x100, 0x900, false));
+
+        // Removing the duplicate slot leaves the range live and the cache intact.
+        viewed.set_seen(1, None);
+        assert_eq!(viewed.generation(), g2);
+        assert!(Arc::ptr_eq(&grown1, &viewed.ranges()));
+
+        // Removing the far range shrinks the hull and replaces the cached Arc.
+        viewed.set_seen(2, None);
+        let g3 = viewed.generation();
+        assert!(g3 > g2);
+        let shrunk1 = viewed.ranges();
+        let shrunk2 = viewed.ranges();
+        assert!(!Arc::ptr_eq(&grown1, &shrunk1));
+        assert!(Arc::ptr_eq(&shrunk1, &shrunk2));
+        assert_eq!((shrunk1[0].1, shrunk1[0].2), (0x100, 0x100));
+
+        // Removing the last range empties the hulls with a fresh Arc.
+        viewed.set_seen(0, None);
+        assert!(viewed.generation() > g3);
+        let gone = viewed.ranges();
+        assert!(!Arc::ptr_eq(&shrunk1, &gone));
+        assert!(gone.is_empty());
     }
 
     /// The title writes a buffer and a texture, and views of them and of an

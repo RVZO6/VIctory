@@ -98,7 +98,9 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> 
         key.update(s.stage.as_bytes());
         key.update(s.hash.as_bytes());
     }
-    key.update(graphics.map(|g| g.describe()).unwrap_or_default().as_bytes());
+    if let Some(g) = graphics {
+        let _ = g.write_description(&mut super::Blake3Writer(&mut key));
+    }
     key.finalize().to_hex()[..32].to_owned()
 }
 

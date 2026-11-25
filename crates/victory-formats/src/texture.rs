@@ -279,8 +279,8 @@ const BLOCK_256_3D: [[u32; 3]; 5] = [[8, 4, 8], [4, 4, 8], [4, 4, 4], [4, 2, 4],
 const BLOCK_1K_3D: [[u32; 3]; 5] = [[16, 8, 8], [8, 8, 8], [8, 8, 4], [8, 4, 4], [4, 4, 4]];
 
 impl Layout {
-    pub fn new(desc: &Desc) -> Result<Layout, Error> {
-        let d = *desc;
+    /// Validates `desc` and returns `log2` of its block size (0 for linear).
+    fn validate_desc(d: &Desc) -> Result<u32, Error> {
         let block_log2 = d.swizzle.block_log2().ok_or(Error::Invalid)?;
         let valid = (1..=MAX_EXTENT).contains(&d.width)
             && (1..=MAX_EXTENT).contains(&d.height)
@@ -299,11 +299,21 @@ impl Layout {
         if !valid {
             return Err(Error::Invalid);
         }
+        Ok(block_log2)
+    }
+
+    fn build(d: Desc, block_log2: u32) -> Layout {
         if block_log2 == 0 {
-            Ok(Layout::linear(d))
+            Layout::linear(d)
         } else {
-            Ok(Layout::tiled(d, block_log2))
+            Layout::tiled(d, block_log2)
         }
+    }
+
+    pub fn new(desc: &Desc) -> Result<Layout, Error> {
+        let d = *desc;
+        let block_log2 = Layout::validate_desc(&d)?;
+        Ok(Layout::build(d, block_log2))
     }
 
     /// `HwlComputeSurfaceInfoLinear`: rows aligned to 256 bytes, mips packed
@@ -818,7 +828,10 @@ pub struct Texture {
 }
 
 impl Texture {
-    pub fn new(desc: &TextureDesc) -> Result<Texture, Error> {
+    /// Validates `desc` and resolves its primary plane description, block
+    /// size `log2`, and whether it carries a stencil plane, without
+    /// allocating plane or mip tables.
+    fn resolve(desc: &TextureDesc) -> Result<(Desc, u32, bool), Error> {
         let f = format(desc.format).ok_or(Error::Invalid)?;
         let depth3d = if desc.dimension == Dimension::Tex3d {
             desc.depth_or_array
@@ -829,24 +842,50 @@ impl Texture {
             0 => 32 - desc.width.max(desc.height).max(depth3d).max(1).leading_zeros(),
             n => n,
         };
-        let plane = |bytes| Desc {
+        let primary = Desc {
             dimension: desc.dimension,
             width: desc.width,
             height: desc.height,
             depth: desc.depth_or_array,
             mips,
-            element_bytes: bytes,
+            element_bytes: f.bytes,
             block: f.block,
             samples: desc.samples.max(1),
             swizzle: desc.swizzle,
         };
+        let block_log2 = Layout::validate_desc(&primary)?;
+        if f.stencil {
+            Layout::validate_desc(&Desc {
+                element_bytes: 1,
+                ..primary
+            })?;
+        }
+        Ok((primary, block_log2, f.stencil))
+    }
+
+    /// Validates `desc` with the exact rules of [`Texture::new`] and returns
+    /// its swizzle mode, without allocating plane/mip tables or building
+    /// tile offsets.
+    pub fn validate_swizzle(desc: &TextureDesc) -> Result<Swizzle, Error> {
+        let (primary, _, _) = Texture::resolve(desc)?;
+        Ok(primary.swizzle)
+    }
+
+    pub fn new(desc: &TextureDesc) -> Result<Texture, Error> {
+        let (primary, block_log2, stencil) = Texture::resolve(desc)?;
         let mut planes = vec![Plane {
             offset: 0,
             stencil: false,
-            layout: Layout::new(&plane(f.bytes))?,
+            layout: Layout::build(primary, block_log2),
         }];
-        if f.stencil {
-            let layout = Layout::new(&plane(1))?;
+        if stencil {
+            let layout = Layout::build(
+                Desc {
+                    element_bytes: 1,
+                    ..primary
+                },
+                block_log2,
+            );
             let offset = planes[0].layout.size.next_multiple_of(layout.alignment);
             planes.push(Plane {
                 offset,
@@ -1364,5 +1403,78 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn validate_swizzle_matches_texture_new() {
+        let dimensions = [Dimension::Tex1d, Dimension::Tex2d, Dimension::Tex3d];
+        let formats = [
+            0,   // invalid
+            2,   // 16-byte
+            6,   // 96-bit (unsupported)
+            10,  // 8-byte
+            20,  // 4-byte + stencil
+            28,  // 4-byte
+            45,  // 4-byte + stencil
+            49,  // 2-byte
+            61,  // 1-byte
+            66,  // 1-bit (unsupported)
+            71,  // BC1
+            98,  // BC7
+            118, // 2-byte + stencil
+            189, // console-only (unsupported)
+        ];
+        let samples = [0, 1, 2, 3, 4, 8, 16];
+        let mips = [0, 1, 4, 16, 17];
+        let extents = [
+            (0, 1, 1),
+            (1, 0, 1),
+            (1, 1, 0),
+            (1, 1, 1),
+            (4, 1, 1),
+            (4, 4, 1),
+            (4, 4, 4),
+            (4096, 1, 1),
+            (MAX_EXTENT, 1, 1),
+            (MAX_EXTENT + 1, 1, 1),
+            (1, MAX_EXTENT + 1, 1),
+            (1, 1, MAX_EXTENT + 1),
+            (u32::MAX, 1, 1),
+        ];
+        let mut ok_count = 0usize;
+        let mut err_count = 0usize;
+        for dimension in dimensions {
+            for swizzle in (0..=31).chain(std::iter::once(0xff)).map(Swizzle) {
+                for format in formats {
+                    for sample_count in samples {
+                        for mip_count in mips {
+                            for (width, height, depth_or_array) in extents {
+                                let d = TextureDesc {
+                                    dimension,
+                                    width,
+                                    height,
+                                    depth_or_array,
+                                    mips: mip_count,
+                                    format,
+                                    samples: sample_count,
+                                    swizzle,
+                                };
+                                let fast = Texture::validate_swizzle(&d);
+                                let full =
+                                    Texture::new(&d).map(|t| t.planes[0].layout.desc.swizzle);
+                                assert_eq!(fast, full, "{d:?}");
+                                if fast.is_ok() {
+                                    ok_count += 1;
+                                } else {
+                                    err_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(ok_count > 0);
+        assert!(err_count > 0);
     }
 }

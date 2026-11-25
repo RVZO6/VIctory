@@ -183,6 +183,9 @@ pub fn track(
     // and loads that entry: accesses, offset reads and loads by block.
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
+    // O(1) index of scalar/global addresses recorded in `out.scalar` so far
+    // (first entry wins, matching a linear search of `out.scalar`).
+    let mut scalar_at = std::collections::HashMap::<Site, Address>::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -196,7 +199,7 @@ pub fn track(
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 if let Source::Loaded { load, .. } = source
-                    && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
+                    && let Some(&a) = scalar_at.get(&load)
                     && let Some(Term::Value(v)) = a.dynamic.map(|d| t.origin(d))
                     && t.first_lane_source(v).is_some()
                 {
@@ -239,6 +242,7 @@ pub fn track(
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
                     let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
+                    scalar_at.entry(site).or_insert(address);
                     out.scalar.push((site, address));
                 }
                 Fields::Flat {
@@ -250,6 +254,7 @@ pub fn track(
                     let address = t
                         .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
                         .map_err(fail)?;
+                    scalar_at.entry(site).or_insert(address);
                     out.scalar.push((site, address));
                 }
                 _ => {}
@@ -3579,5 +3584,41 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn many_scalar_descriptor_loads_and_waterfall_offset_track_cleanly() {
+        // Prepend 512 table descriptor loads + buffer stores before the
+        // waterfall loop so `track`'s scalar load lookup runs across hundreds
+        // of recorded scalar sites and still finds the waterfall's offset load.
+        let mut words = WATERFALL_INDEXED_WAVE32[..8].to_vec();
+        const EXTRA_LOADS: usize = 512;
+        for _ in 0..EXTRA_LOADS {
+            words.extend_from_slice(&[
+                0xF408_0A02,
+                0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+                0xE070_1000,
+                0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            ]);
+        }
+        words.extend_from_slice(&WATERFALL_INDEXED_WAVE32[8..]);
+        let r = waterfall(&words, false).unwrap();
+        assert_eq!(r.scalar.len(), EXTRA_LOADS + 3);
+        assert_eq!(r.descriptors.len(), EXTRA_LOADS + 3);
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| {
+                d.role == Role::Resource
+                    && matches!(d.source, Source::Loaded { load, first: 0 }
+                        if r.scalar.iter().any(|s| s.0 == load && s.1.dynamic.is_some()))
+            })
+            .expect("waterfall image descriptor");
+        let Source::Loaded { load, .. } = image.source else {
+            unreachable!()
+        };
+        assert_eq!(r.waterfall.compares.len(), 1);
+        assert_eq!(r.waterfall.reads.len(), 1);
+        assert_eq!(r.waterfall.loads, [load]);
     }
 }

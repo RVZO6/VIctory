@@ -47,7 +47,7 @@
 //! public); programs use the ratios and the denominator's sign.
 
 use super::{Lower, Why};
-use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
+use crate::emit::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{Inst, Reg};
 use crate::resource::Source;
@@ -209,18 +209,46 @@ impl Lower<'_> {
         let pairs: Vec<(V, V)> = tail.iter().map(|&t| (t, zero)).collect();
         let tail = self.end_guarded(at, &pairs);
         let w: Vec<V> = w.into_iter().chain(tail).collect();
-        let boxes = self.bvh_box(&w, ty, ray);
-        let tri = self.bvh_triangle(&w, ty, ray);
+        // Pure ALU below: branch by node type so waves skip unused paths.
         let c = self.cur;
         let four = self.s.m.i32(4);
         let six = self.s.m.i32(6);
-        let is_tri = self.s.m.cmp(c, pred::IULT, ty, four);
         let t6 = self.s.m.bin(c, Bin::And, ty, six);
         let is_box = self.s.m.cmp(c, pred::EQ, t6, four);
+        let box_blk = self.s.m.new_block();
+        let other_blk = self.s.m.new_block();
+        let tri_blk = self.s.m.new_block();
+        let join_blk = self.s.m.new_block();
+        self.s
+            .m
+            .terminate(c, Term::CondBr(is_box, box_blk, other_blk));
+
+        self.cur = box_blk;
+        let boxes = self.bvh_box(&w, ty, ray);
+        let box_end = self.cur;
+        self.s.m.terminate(box_end, Term::Br(join_blk));
+
+        self.cur = other_blk;
+        let is_tri = self.s.m.cmp(other_blk, pred::IULT, ty, four);
+        self.s
+            .m
+            .terminate(other_blk, Term::CondBr(is_tri, tri_blk, join_blk));
+
+        self.cur = tri_blk;
+        let tri = self.bvh_triangle(&w, ty, ray);
+        let tri_end = self.cur;
+        self.s.m.terminate(tri_end, Term::Br(join_blk));
+
+        self.cur = join_blk;
+        let i32t = self.s.t.i32;
         let none = self.s.m.i32(INVALID);
         Ok(std::array::from_fn(|k| {
-            let x = self.s.m.select(c, is_box, boxes[k], none);
-            self.s.m.select(c, is_tri, tri[k], x)
+            let phi = self.s.m.phi(join_blk, i32t);
+            self.s.m.set_phi(
+                phi,
+                vec![(boxes[k], box_end), (tri[k], tri_end), (none, other_blk)],
+            );
+            phi
         }))
     }
 
@@ -297,36 +325,60 @@ impl Lower<'_> {
     /// The child pointers of a box node (`w`: its 28 dwords, past 16 zero
     /// unless box32), sorted by distance.
     fn bvh_box(&mut self, w: &[V], ty: V, ray: &Ray) -> [V; 4] {
-        let c = self.cur;
+        let head = self.cur;
         let four = self.s.m.i32(4);
-        let is16 = self.s.m.cmp(c, pred::EQ, ty, four);
+        let is16 = self.s.m.cmp(head, pred::EQ, ty, four);
         let f32t = self.s.t.f32;
+        let box16 = self.s.m.new_block();
+        let box32 = self.s.m.new_block();
+        let slab = self.s.m.new_block();
+        self.s.m.terminate(head, Term::CondBr(is16, box16, box32));
+
+        // Unpack the 24 f16 bounds only for box16 nodes.
+        self.cur = box16;
+        let k16 = self.s.m.i32(16);
+        let bounds16: [[V; 6]; 4] = std::array::from_fn(|i| {
+            std::array::from_fn(|j| {
+                // f16 pairs: minx|miny, minz|maxx, maxy|maxz.
+                let half = w[4 + 3 * i + j / 2];
+                let half = if j % 2 == 1 {
+                    self.s.m.bin(box16, Bin::LShr, half, k16)
+                } else {
+                    half
+                };
+                self.s
+                    .op(box16, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[half])
+            })
+        });
+        self.s.m.terminate(box16, Term::Br(slab));
+
+        // Bitcast the 24 f32 bounds only for box32 nodes.
+        self.cur = box32;
+        let bounds32: [[V; 6]; 4] =
+            std::array::from_fn(|i| std::array::from_fn(|j| self.as_float(w[4 + 6 * i + j])));
+        self.s.m.terminate(box32, Term::Br(slab));
+
+        self.cur = slab;
+        let c = slab;
+        let bounds: [[V; 6]; 4] = std::array::from_fn(|i| {
+            std::array::from_fn(|j| {
+                let phi = self.s.m.phi(c, f32t);
+                self.s
+                    .m
+                    .set_phi(phi, vec![(bounds16[i][j], box16), (bounds32[i][j], box32)]);
+                phi
+            })
+        });
         let zero = self.s.m.f32(0);
         let (inf, ninf) = (
             self.s.m.f32(f32::INFINITY.to_bits()),
             self.s.m.f32(f32::NEG_INFINITY.to_bits()),
         );
         let none = self.s.m.i32(INVALID);
+        let pos: [V; 3] = std::array::from_fn(|a| self.s.m.cmp(c, pred::OGE, ray.inv[a], zero));
         let mut child = [none; 4];
         let mut key = [zero; 4];
-        for i in 0..4 {
-            // min xyz, max xyz.
-            let mut b = [zero; 6];
-            for (j, x) in b.iter_mut().enumerate() {
-                let wide = self.as_float(w[4 + 6 * i + j]);
-                // f16 pairs: minx|miny, minz|maxx, maxy|maxz.
-                let half = w[4 + 3 * i + j / 2];
-                let half = if j % 2 == 1 {
-                    let k16 = self.s.m.i32(16);
-                    self.s.m.bin(c, Bin::LShr, half, k16)
-                } else {
-                    half
-                };
-                let half = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[half]);
-                *x = self.s.m.select(c, is16, half, wide);
-            }
+        for (i, b) in bounds.iter().enumerate() {
             let mut nan = self.s.m.bool(false);
             let (mut near, mut far) = (zero, inf);
             for a in 0..3 {
@@ -334,12 +386,11 @@ impl Lower<'_> {
                 let dhi = self.s.m.bin(c, Bin::Sub, b[3 + a], ray.origin[a]);
                 let tlo = self.s.m.bin(c, Bin::Mul, dlo, ray.inv[a]);
                 let thi = self.s.m.bin(c, Bin::Mul, dhi, ray.inv[a]);
-                let pos = self.s.m.cmp(c, pred::OGE, ray.inv[a], zero);
-                let mut n = self.s.m.select(c, pos, tlo, thi);
-                let mut x = self.s.m.select(c, pos, thi, tlo);
+                let mut n = self.s.m.select(c, pos[a], tlo, thi);
+                let mut x = self.s.m.select(c, pos[a], thi, tlo);
                 // A ray in the plane (0 * inf) is not bounded by it.
                 for (t, d, open) in [(&mut n, [dlo, dhi], ninf), (&mut x, [dhi, dlo], inf)] {
-                    let d = self.s.m.select(c, pos, d[0], d[1]);
+                    let d = self.s.m.select(c, pos[a], d[0], d[1]);
                     let on = self.s.m.cmp(c, pred::OEQ, d, zero);
                     let undefined = self.s.m.cmp(c, pred::UNO, *t, *t);
                     let both = self.s.m.bin(c, Bin::And, on, undefined);

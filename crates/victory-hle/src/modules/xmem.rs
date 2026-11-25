@@ -437,11 +437,45 @@ fn shown_at(pages: &[usize]) -> Vec<usize> {
         .collect()
 }
 
+/// Merges `pages` (each `page_size` bytes) into sorted, non-overlapping
+/// `(start, len)` runs so change tracking can be notified once per contiguous
+/// range instead of once per page.
+fn coalesce_pages(pages: &[usize], page_size: usize) -> Vec<(usize, usize)> {
+    if pages.is_empty() || page_size == 0 {
+        return Vec::new();
+    }
+    if pages.len() == 1 {
+        return vec![(pages[0], page_size)];
+    }
+    let mut sorted = pages.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for page in sorted {
+        match runs.last_mut() {
+            Some((start, len))
+                if start.checked_add(*len) == Some(page)
+                    && page.checked_add(page_size).is_some() =>
+            {
+                *len += page_size;
+            }
+            _ => runs.push((page, page_size)),
+        }
+    }
+    runs
+}
+
 /// Reports writes into physical pages through our own views at every title
 /// view showing them (DirectStorage's page destinations).
 fn report_written(shown: &[usize]) {
-    for &page in shown {
-        drop(victory_gpu::kernel_will_write(page, PAGE));
+    match shown {
+        [] => {}
+        &[page] => drop(victory_gpu::kernel_will_write(page, PAGE)),
+        _ => {
+            for (start, len) in coalesce_pages(shown, PAGE) {
+                drop(victory_gpu::kernel_will_write(start, len));
+            }
+        }
     }
 }
 
@@ -1363,5 +1397,65 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn coalesce_pages_empty_and_single() {
+        assert_eq!(coalesce_pages(&[], PAGE), Vec::new());
+        assert_eq!(coalesce_pages(&[0x10_0000], 0), Vec::new());
+        assert_eq!(coalesce_pages(&[0x10_0000], PAGE), vec![(0x10_0000, PAGE)]);
+    }
+
+    #[test]
+    fn coalesce_pages_merges_sorted_contiguous_run() {
+        let pages = [0x20_0000, 0x20_0000 + PAGE, 0x20_0000 + 2 * PAGE];
+        assert_eq!(coalesce_pages(&pages, PAGE), vec![(0x20_0000, 3 * PAGE)]);
+    }
+
+    #[test]
+    fn coalesce_pages_sorts_dedups_and_splits_disjoint_runs() {
+        let pages = [
+            0x50_0000 + PAGE,
+            0x10_0000 + PAGE,
+            0x10_0000,
+            0x50_0000,
+            0x10_0000 + PAGE,
+            0x10_0000 + 2 * PAGE,
+            0x90_0000,
+        ];
+        assert_eq!(
+            coalesce_pages(&pages, PAGE),
+            vec![
+                (0x10_0000, 3 * PAGE),
+                (0x50_0000, 2 * PAGE),
+                (0x90_0000, PAGE),
+            ]
+        );
+    }
+
+    #[test]
+    fn coalesce_pages_guards_overflow_near_max() {
+        // Adjacent pages whose merged end equals usize::MAX still coalesce.
+        assert_eq!(
+            coalesce_pages(&[usize::MAX - 2 * PAGE, usize::MAX - PAGE], PAGE),
+            vec![(usize::MAX - 2 * PAGE, 2 * PAGE)]
+        );
+        // Merging the trailing page at usize::MAX would overflow start + len.
+        assert_eq!(
+            coalesce_pages(
+                &[usize::MAX - 2 * PAGE, usize::MAX - PAGE, usize::MAX],
+                PAGE
+            ),
+            vec![(usize::MAX - 2 * PAGE, 2 * PAGE), (usize::MAX, PAGE)]
+        );
+        // A start whose start + PAGE already overflows must neither wrap nor panic.
+        assert_eq!(
+            coalesce_pages(&[usize::MAX, usize::MAX - PAGE + 1, 0], PAGE),
+            vec![
+                (0, PAGE),
+                (usize::MAX - PAGE + 1, PAGE),
+                (usize::MAX, PAGE),
+            ]
+        );
     }
 }

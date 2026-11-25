@@ -38,6 +38,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    pub(crate) device10: Option<ID3D12Device10>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -191,6 +192,7 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let device10 = device.cast().ok();
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -239,6 +241,7 @@ fn create() -> windows::core::Result<Host> {
         }
         Ok(Host {
             device,
+            device10,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -457,6 +460,42 @@ mod tests {
         node.pCommandListDebugNameA = longer.as_ptr().cast();
         assert!(!list.is_node(&node), "a number that only starts with ours is no match");
     }
+
+    #[test]
+    fn batch_deduplicates_heap_and_memory_steps() {
+        let mut batch = Batch::default();
+        // Heap steps: once per heap while its generation holds.
+        assert!(batch.heap_due(0x1000, 1));
+        assert!(batch.heap_due(0x2000, 1));
+        assert!(!batch.heap_due(0x1000, 1));
+        assert!(!batch.heap_due(0x2000, 1));
+        // Advancing the heap's generation re-fires that heap only.
+        assert!(batch.heap_due(0x1000, 2));
+        assert!(!batch.heap_due(0x1000, 2));
+        assert!(!batch.heap_due(0x2000, 1));
+
+        // Memory steps: once per heap key while shadow generation holds.
+        assert!(batch.memory_due(0x3000, 7));
+        assert!(batch.memory_due(0x4000, 7));
+        assert!(!batch.memory_due(0x3000, 7));
+        assert!(!batch.memory_due(0x4000, 7));
+        // Advancing shadow generation re-fires for that key only.
+        assert!(batch.memory_due(0x3000, 8));
+        assert!(!batch.memory_due(0x3000, 8));
+        assert!(!batch.memory_due(0x4000, 7));
+
+        // A title write resets both heaps and memories for the same generations.
+        batch.title_written();
+        assert!(batch.heap_due(0x1000, 2));
+        assert!(!batch.heap_due(0x1000, 2));
+        assert!(batch.memory_due(0x3000, 8));
+        assert!(!batch.memory_due(0x3000, 8));
+
+        // A fresh submission starts over.
+        let mut next = Batch::default();
+        assert!(next.heap_due(0x1000, 2));
+        assert!(next.memory_due(0x3000, 8));
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -642,11 +681,13 @@ enum Step {
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
     /// Brings every buffer range a view heap's views reach up to date
-    /// (`crate::bindless`).
+    /// (`crate::bindless`): once per submission per heap generation, until a
+    /// `Copy` or `Run` intervenes.
     Heap(std::sync::Arc<crate::bindless::Viewed>),
     /// Shaders read title memory through a view heap's page table (the
     /// heap's key, `crate::memory`): the table names every copy, each
-    /// brought up to date.
+    /// brought up to date, once per submission per shadow generation until a
+    /// `Copy` or `Run` intervenes.
     Memory(usize),
 }
 
@@ -1867,11 +1908,15 @@ impl HostList {
                     continue;
                 }
                 Step::Heap(viewed) => {
-                    crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    if batch.heap_due(std::sync::Arc::as_ptr(viewed) as usize, viewed.generation()) {
+                        crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
+                    }
                     continue;
                 }
                 &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    if batch.memory_due(heap, crate::shadow::generation()) {
+                        crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    }
                     continue;
                 }
             };
@@ -1894,7 +1939,9 @@ impl HostList {
 /// until a step writes title memory: every list of a world submission using
 /// title memory asks for every copy whole. What the title's threads write
 /// meanwhile is for later submissions (on the console it would race the
-/// GPU).
+/// GPU). Likewise, a heap's bindless buffer hulls and title-memory page table
+/// are walked once per submission until a title write intervenes or their
+/// generation advances.
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
@@ -1905,6 +1952,13 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// View heaps (by address) whose buffer hulls were queued since the last
+    /// title write, with the heap generation seen then.
+    heaps: std::collections::HashMap<usize, u64>,
+    /// View heaps (by key) whose title-memory page table and copies were
+    /// prepared since the last title write, with the shadow generation seen
+    /// then.
+    memories: std::collections::HashMap<usize, u64>,
 }
 
 impl Batch {
@@ -1931,12 +1985,29 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
+    /// Whether view heap `key`'s bindless buffer hulls are still to be queued
+    /// in this submission at `generation` (and notes them queued at
+    /// `generation`).
+    fn heap_due(&mut self, key: usize, generation: u64) -> bool {
+        self.heaps.insert(key, generation) != Some(generation)
+    }
+
+    /// Whether view heap `key`'s title-memory page table and copies are still
+    /// to be prepared in this submission at shadow `generation` (and notes
+    /// them prepared at `generation`).
+    fn memory_due(&mut self, key: usize, generation: u64) -> bool {
+        self.memories.insert(key, generation) != Some(generation)
+    }
+
     /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
+    /// first, and textures, heaps and title-memory tables are checked again
+    /// after it.
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
         self.current.clear();
+        self.heaps.clear();
+        self.memories.clear();
     }
 
     /// Does the refreshes; returns the bytes copied.

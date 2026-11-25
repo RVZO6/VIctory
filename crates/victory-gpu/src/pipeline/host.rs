@@ -6,6 +6,7 @@
 //! the immediate samplers, and directly indexed heaps.
 
 use std::ffi::{CStr, CString};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use victory_shader::emit::{MEMORY_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
@@ -169,32 +170,51 @@ impl GraphicsState {
         }
     }
 
-    /// Everything the state holds, as text: part of a pipeline's name in
-    /// the library and of the key a title pipeline is started early by.
-    pub(crate) fn describe(&self) -> String {
-        let inputs: Vec<String> = self
-            .inputs
-            .iter()
-            .zip(&self.names)
-            .map(|(e, name)| {
-                format!(
-                    "{name:?} {} {} {} {} {} {}",
-                    e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset, e.InputSlotClass.0, e.InstanceDataStepRate
-                )
-            })
-            .collect();
-        format!(
-            "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}",
-            self.blend,
-            self.sample_mask,
-            self.rasterizer,
-            self.depth,
+    /// Streams everything the state holds as text, matching [`Self::describe`]
+    /// byte-for-byte without allocating intermediate `String` or `Vec` buffers.
+    pub(crate) fn write_description(
+        &self,
+        out: &mut (impl std::fmt::Write + ?Sized),
+    ) -> std::fmt::Result {
+        write!(
+            out,
+            "{:?} {} {:?} {:?} [",
+            self.blend, self.sample_mask, self.rasterizer, self.depth,
+        )?;
+        for (i, (e, name)) in self.inputs.iter().zip(&self.names).enumerate() {
+            if i > 0 {
+                out.write_str(", ")?;
+            }
+            out.write_char('"')?;
+            write!(
+                DebugStrContent(&mut *out),
+                "{name:?} {} {} {} {} {} {}",
+                e.SemanticIndex,
+                e.Format.0,
+                e.InputSlot,
+                e.AlignedByteOffset,
+                e.InputSlotClass.0,
+                e.InstanceDataStepRate,
+            )?;
+            out.write_char('"')?;
+        }
+        write!(
+            out,
+            "] {} {} {:?} {} {:?}",
             self.strip_cut.0,
             self.topology.0,
             self.targets,
             self.depth_format.0,
-            self.samples
+            self.samples,
         )
+    }
+
+    /// Everything the state holds, as text: part of a pipeline's name in
+    /// the library and of the key a title pipeline is started early by.
+    pub(crate) fn describe(&self) -> String {
+        let mut out = String::new();
+        let _ = self.write_description(&mut out);
+        out
     }
 
     /// The vertex buffer slots the input layout reads.
@@ -233,6 +253,46 @@ impl GraphicsState {
                 }
             })
             .collect()
+    }
+}
+
+/// Escapes written text identically to `Debug` for `str` (without enclosing
+/// quotes) so each input element streams inline inside `["...", "..."]`.
+struct DebugStrContent<'a, W: std::fmt::Write + ?Sized>(&'a mut W);
+
+impl<W: std::fmt::Write + ?Sized> std::fmt::Write for DebugStrContent<'_, W> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let bytes = s.as_bytes();
+        let mut from = 0;
+        for (i, &b) in bytes.iter().enumerate() {
+            if !(0x20..0x7f).contains(&b) || b == b'"' || b == b'\\' {
+                if from < i {
+                    self.0.write_str(&s[from..i])?;
+                }
+                if b < 0x80 {
+                    // Single ASCII byte: `'` (0x27) is handled by the unescaped fast path.
+                    for esc in (b as char).escape_debug() {
+                        self.0.write_char(esc)?;
+                    }
+                    from = i + 1;
+                } else {
+                    for ch in s[i..].chars() {
+                        if ch == '\'' {
+                            self.0.write_char('\'')?;
+                        } else {
+                            for esc in ch.escape_debug() {
+                                self.0.write_char(esc)?;
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        if from < s.len() {
+            self.0.write_str(&s[from..])?;
+        }
+        Ok(())
     }
 }
 
@@ -349,21 +409,9 @@ impl HostPipeline {
         }
         let host = host()?;
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
-        let atomics64 = stages.iter().any(|(s, _)| {
-            let Some(t) = s.translated() else {
-                return false;
-            };
-            victory_shader::Container::parse(&t.host.dxil)
-                .ok()
-                .and_then(|c| {
-                    c.part(victory_shader::FourCC::SFI0)?
-                        .data
-                        .get(..4)?
-                        .try_into()
-                        .ok()
-                })
-                .is_some_and(|b: [u8; 4]| u32::from_le_bytes(b) & 0x1040_0000 != 0)
-        });
+        let atomics64 = stages
+            .iter()
+            .any(|(s, _)| s.translated().is_some_and(|t| t.atomics64));
         if atomics64 && !host.heap_atomics64() {
             return refuse(
                 "the host GPU has no 64-bit atomics on typed heap resources",
@@ -567,13 +615,12 @@ impl HostPipeline {
         let Some(g) = g else {
             return refuse("graphics state not kept (plain description)", shaders);
         };
-        let state = g.describe();
         if mesh.is_some() {
-            let name = super::library::name(
+            let name = super::library::name_with(
                 "mesh",
                 &root_blob,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-                &state,
+                |out| g.write_description(out),
             );
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
                 Ok(pso) => pso,
@@ -637,11 +684,11 @@ impl HostPipeline {
             SampleDesc: g.samples,
             ..Default::default()
         };
-        let name = super::library::name(
+        let name = super::library::name_with(
             "graphics",
             &root_blob,
             &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs],
-            &state,
+            |out| g.write_description(out),
         );
         let started = std::time::Instant::now();
         let made = super::library::pipeline(
@@ -869,5 +916,312 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    fn legacy_describe(g: &GraphicsState) -> String {
+        let inputs: Vec<String> = g
+            .inputs
+            .iter()
+            .zip(&g.names)
+            .map(|(e, name)| {
+                format!(
+                    "{name:?} {} {} {} {} {} {}",
+                    e.SemanticIndex,
+                    e.Format.0,
+                    e.InputSlot,
+                    e.AlignedByteOffset,
+                    e.InputSlotClass.0,
+                    e.InstanceDataStepRate,
+                )
+            })
+            .collect();
+        format!(
+            "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}",
+            g.blend,
+            g.sample_mask,
+            g.rasterizer,
+            g.depth,
+            g.strip_cut.0,
+            g.topology.0,
+            g.targets,
+            g.depth_format.0,
+            g.samples,
+        )
+    }
+
+    type InputSpec<'a> = (
+        &'a [u8],
+        u32,
+        DXGI_FORMAT,
+        u32,
+        u32,
+        D3D12_INPUT_CLASSIFICATION,
+        u32,
+    );
+
+    fn with_inputs(mut g: GraphicsState, elems: &[InputSpec<'_>]) -> GraphicsState {
+        g.names = elems
+            .iter()
+            .map(|(name, ..)| CString::new(*name).unwrap())
+            .collect();
+        g.inputs = elems
+            .iter()
+            .zip(&g.names)
+            .map(|(&(_, index, format, slot, offset, class, step), name)| {
+                D3D12_INPUT_ELEMENT_DESC {
+                    SemanticName: PCSTR(name.as_ptr().cast()),
+                    SemanticIndex: index,
+                    Format: format,
+                    InputSlot: slot,
+                    AlignedByteOffset: offset,
+                    InputSlotClass: class,
+                    InstanceDataStepRate: step,
+                }
+            })
+            .collect();
+        g
+    }
+
+    #[test]
+    fn write_description_matches_legacy_describe_and_blake3() {
+        let empty = GraphicsState::default();
+
+        let single = with_inputs(
+            GraphicsState::default(),
+            &[(
+                b"POSITION",
+                0,
+                DXGI_FORMAT_R32G32B32_FLOAT,
+                0,
+                0,
+                D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                0,
+            )],
+        );
+
+        let escaped = with_inputs(
+            GraphicsState::default(),
+            &[
+                (
+                    b"TEXCOORD",
+                    2,
+                    DXGI_FORMAT_R32G32_FLOAT,
+                    1,
+                    8,
+                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                    0,
+                ),
+                (
+                    br#"QUO"TE\SLASH'APOS"#,
+                    1,
+                    DXGI_FORMAT_R8G8B8A8_UNORM,
+                    2,
+                    D3D12_APPEND_ALIGNED_ELEMENT,
+                    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+                    4,
+                ),
+                (
+                    b"LINE\nTAB\tCR\rCTRL\x01DEL\x7f",
+                    3,
+                    DXGI_FORMAT_R16G16_FLOAT,
+                    0,
+                    16,
+                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                    0,
+                ),
+                (
+                    b"RAW\xff\x80BYTES",
+                    4,
+                    DXGI_FORMAT_R32_UINT,
+                    3,
+                    24,
+                    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+                    1,
+                ),
+                (
+                    "caf\u{00e9}\u{0301}'x".as_bytes(),
+                    5,
+                    DXGI_FORMAT_R32G32B32A32_FLOAT,
+                    1,
+                    32,
+                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                    0,
+                ),
+                (
+                    b"",
+                    0,
+                    DXGI_FORMAT_R8_UNORM,
+                    0,
+                    48,
+                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                    0,
+                ),
+            ],
+        );
+
+        let mut custom = GraphicsState {
+            sample_mask: 0xdead_beef,
+            strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF,
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            depth_format: DXGI_FORMAT_D32_FLOAT,
+            samples: DXGI_SAMPLE_DESC {
+                Count: 4,
+                Quality: 2,
+            },
+            ..GraphicsState::default()
+        };
+        custom.blend.AlphaToCoverageEnable = true.into();
+        custom.blend.IndependentBlendEnable = true.into();
+        custom.blend.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: true.into(),
+            LogicOpEnable: false.into(),
+            SrcBlend: D3D12_BLEND_SRC_ALPHA,
+            DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
+            BlendOp: D3D12_BLEND_OP_REV_SUBTRACT,
+            SrcBlendAlpha: D3D12_BLEND_ONE,
+            DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
+            BlendOpAlpha: D3D12_BLEND_OP_MAX,
+            LogicOp: D3D12_LOGIC_OP_XOR,
+            RenderTargetWriteMask: 0x07,
+        };
+        custom.blend.RenderTarget[3].RenderTargetWriteMask = 0x01;
+        custom.rasterizer = D3D12_RASTERIZER_DESC {
+            FillMode: D3D12_FILL_MODE_WIREFRAME,
+            CullMode: D3D12_CULL_MODE_NONE,
+            FrontCounterClockwise: true.into(),
+            DepthBias: -7,
+            DepthBiasClamp: 0.25,
+            SlopeScaledDepthBias: 1.5,
+            DepthClipEnable: false.into(),
+            MultisampleEnable: true.into(),
+            AntialiasedLineEnable: true.into(),
+            ForcedSampleCount: 4,
+            ConservativeRaster: D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON,
+        };
+        custom.depth = D3D12_DEPTH_STENCIL_DESC {
+            DepthEnable: true.into(),
+            DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+            DepthFunc: D3D12_COMPARISON_FUNC_GREATER_EQUAL,
+            StencilEnable: true.into(),
+            StencilReadMask: 0x0f,
+            StencilWriteMask: 0xf0,
+            FrontFace: D3D12_DEPTH_STENCILOP_DESC {
+                StencilFailOp: D3D12_STENCIL_OP_REPLACE,
+                StencilDepthFailOp: D3D12_STENCIL_OP_INCR_SAT,
+                StencilPassOp: D3D12_STENCIL_OP_INVERT,
+                StencilFunc: D3D12_COMPARISON_FUNC_NOT_EQUAL,
+            },
+            BackFace: D3D12_DEPTH_STENCILOP_DESC {
+                StencilFailOp: D3D12_STENCIL_OP_ZERO,
+                StencilDepthFailOp: D3D12_STENCIL_OP_DECR,
+                StencilPassOp: D3D12_STENCIL_OP_INCR,
+                StencilFunc: D3D12_COMPARISON_FUNC_EQUAL,
+            },
+        };
+        custom.targets = D3D12_RT_FORMAT_ARRAY {
+            RTFormats: [
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                DXGI_FORMAT_R16G16B16A16_FLOAT,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_FORMAT_UNKNOWN,
+            ],
+            NumRenderTargets: 3,
+        };
+        let custom = with_inputs(
+            custom,
+            &[
+                (
+                    b"SV_Position",
+                    0,
+                    DXGI_FORMAT_R32G32B32A32_FLOAT,
+                    0,
+                    0,
+                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                    0,
+                ),
+                (
+                    b"COLOR\"0'",
+                    1,
+                    DXGI_FORMAT_R8G8B8A8_UNORM,
+                    1,
+                    16,
+                    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+                    2,
+                ),
+            ],
+        );
+
+        let shaders = vec![
+            super::super::shader("vertex", b"write-description-test-vs"),
+            super::super::shader("pixel", b"write-description-test-ps"),
+        ];
+
+        for (label, g) in [
+            ("empty", &empty),
+            ("single", &single),
+            ("escaped", &escaped),
+            ("custom", &custom),
+        ] {
+            let legacy = legacy_describe(g);
+            assert_eq!(g.describe(), legacy, "{label}: describe()");
+
+            let mut written = String::new();
+            g.write_description(&mut written).unwrap();
+            assert_eq!(written, legacy, "{label}: write_description(&mut String)");
+
+            let mut h = blake3::Hasher::new();
+            g.write_description(&mut super::super::Blake3Writer(&mut h))
+                .unwrap();
+            assert_eq!(
+                h.finalize(),
+                blake3::hash(legacy.as_bytes()),
+                "{label}: Blake3Writer digest"
+            );
+
+            // `make::key` matches hashing stages + hashes + legacy `describe()`.
+            let mut legacy_key = blake3::Hasher::new();
+            for s in &shaders {
+                legacy_key.update(s.stage.as_bytes());
+                legacy_key.update(s.hash.as_bytes());
+            }
+            legacy_key.update(legacy.as_bytes());
+            assert_eq!(
+                super::super::make::key(&shaders, Some(g)),
+                legacy_key.finalize().to_hex()[..32],
+                "{label}: make::key"
+            );
+
+            // `library::name_with` matches `library::name` with legacy `describe()`.
+            assert_eq!(
+                super::super::library::name_with(
+                    "graphics",
+                    b"root-blob",
+                    &[b"vs-code", b"ps-code"],
+                    |out| g.write_description(out),
+                ),
+                super::super::library::name(
+                    "graphics",
+                    b"root-blob",
+                    &[b"vs-code", b"ps-code"],
+                    &legacy,
+                ),
+                "{label}: library::name_with"
+            );
+        }
+
+        // Compute / no-graphics-state key parity.
+        let mut legacy_compute = blake3::Hasher::new();
+        for s in &shaders {
+            legacy_compute.update(s.stage.as_bytes());
+            legacy_compute.update(s.hash.as_bytes());
+        }
+        assert_eq!(
+            super::super::make::key(&shaders, None),
+            legacy_compute.finalize().to_hex()[..32],
+        );
     }
 }
