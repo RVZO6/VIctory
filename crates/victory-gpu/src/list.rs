@@ -1013,7 +1013,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, host_list, with_state};
+    use super::{This, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -1035,25 +1035,19 @@ mod state {
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
-        if let Some(list) = host_list(this) {
-            crate::draw::viewports(list, items(viewports, count));
-        }
+        with_state(this, |list, s| s.set_viewports(list, items(viewports, count)));
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
-        if let Some(list) = host_list(this) {
-            crate::draw::scissors(list, items(rects, count));
-        }
+        with_state(this, |list, s| s.set_scissors(list, items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
-        if let Some(list) = host_list(this) {
+        with_state(this, |list, s| {
             // SAFETY: the title passes four floats or null.
-            crate::draw::blend_factor(list, unsafe { factor.as_ref() });
-        }
+            s.set_blend_factor(list, unsafe { factor.as_ref() });
+        });
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
-        if let Some(list) = host_list(this) {
-            crate::draw::stencil_ref(list, reference);
-        }
+        with_state(this, |list, s| s.set_stencil_ref(list, reference));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
