@@ -16,10 +16,10 @@
 //! signed compares, what a relative move writes) is unbounded, and a move
 //! with an unbounded index keeps today's range.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::ShaderError;
-use crate::gfx10::{Fields, Operand};
+use crate::gfx10::{Encoding, Fields, Operand};
 use crate::ir::{self, EXEC, Inst, M0, Program, Reg, Value};
 use crate::structure::{self, Atom, LaneExit, Structured};
 
@@ -80,30 +80,87 @@ pub fn build(
     Ok((p, st))
 }
 
-fn relative(inst: &Inst) -> bool {
+const fn vop1_opcode(target: &str) -> u16 {
+    let want = target.as_bytes();
+    let mut i = 0;
+    while i < crate::gfx10::opcodes::VOP1.len() {
+        let (op, name) = crate::gfx10::opcodes::VOP1[i];
+        let got = name.as_bytes();
+        if got.len() == want.len() {
+            let mut j = 0;
+            let mut eq = true;
+            while j < got.len() {
+                if got[j] != want[j] {
+                    eq = false;
+                    break;
+                }
+                j += 1;
+            }
+            if eq {
+                return op;
+            }
+        }
+        i += 1;
+    }
+    panic!("missing VOP1 opcode in gfx10::opcodes")
+}
+
+const V_MOVRELD_B32: u16 = vop1_opcode("v_movreld_b32");
+const V_MOVRELS_B32: u16 = vop1_opcode("v_movrels_b32");
+const V_MOVRELSD_B32: u16 = vop1_opcode("v_movrelsd_b32");
+const V_MOVRELSD_2_B32: u16 = vop1_opcode("v_movrelsd_2_b32");
+const V_SWAPREL_B32: u16 = vop1_opcode("v_swaprel_b32");
+
+#[inline]
+fn relative_opcode(encoding: Encoding, opcode: u16) -> bool {
+    let op = match encoding {
+        Encoding::Vop1 => opcode,
+        // VOP3 encodes VOP1 opcodes at 0x180..0x200.
+        Encoding::Vop3 if (0x180..0x200).contains(&opcode) => opcode - 0x180,
+        _ => return false,
+    };
     matches!(
-        inst.name(),
-        "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" | "v_movrelsd_2_b32" | "v_swaprel_b32"
+        op,
+        V_MOVRELD_B32 | V_MOVRELS_B32 | V_MOVRELSD_B32 | V_MOVRELSD_2_B32 | V_SWAPREL_B32
     )
+}
+
+#[inline]
+fn relative(inst: &Inst) -> bool {
+    relative_opcode(inst.machine.encoding, inst.machine.opcode)
 }
 
 /// The largest M0 each relative move can see, by instruction offset
 /// (`u32::MAX`: unbounded).
 fn relative_bounds(p: &Program, st: &Structured) -> HashMap<usize, u32> {
+    let mut max_val = 0usize;
+    for &(_, v) in &p.inputs {
+        max_val = max_val.max(v.0 as usize + 1);
+    }
+    for block in &p.blocks {
+        for phi in &block.phis {
+            max_val = max_val.max(phi.value.0 as usize + 1);
+        }
+        for inst in &block.insts {
+            for &(_, v) in &inst.writes {
+                max_val = max_val.max(v.0 as usize + 1);
+            }
+        }
+    }
     let mut r = Ranges {
         p,
         st,
-        defs: HashMap::new(),
-        memo: HashMap::new(),
-        busy: HashSet::new(),
+        defs: vec![None; max_val],
+        memo: vec![None; max_val],
+        busy: vec![false; max_val],
     };
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, phi) in block.phis.iter().enumerate() {
-            r.defs.insert(phi.value, Def::Phi(b, i));
+            r.defs[phi.value.0 as usize] = Some(Def::Phi(b, i));
         }
         for (i, inst) in block.insts.iter().enumerate() {
             for w in &inst.writes {
-                r.defs.insert(w.1, Def::Inst(b, i));
+                r.defs[w.1.0 as usize] = Some(Def::Inst(b, i));
             }
         }
     }
@@ -131,23 +188,28 @@ enum Def {
 struct Ranges<'a> {
     p: &'a Program,
     st: &'a Structured,
-    defs: HashMap<Value, Def>,
-    memo: HashMap<Value, u32>,
+    defs: Vec<Option<Def>>,
+    memo: Vec<Option<u32>>,
     /// Values being bounded: met again, a cycle, unbounded.
-    busy: HashSet<Value>,
+    busy: Vec<bool>,
 }
 
 impl Ranges<'_> {
     /// The largest unsigned value `v` takes in any lane that defines it.
     fn hi(&mut self, v: Value) -> u32 {
-        if let Some(&h) = self.memo.get(&v) {
-            return h;
-        }
-        if !self.busy.insert(v) {
+        let idx = v.0 as usize;
+        if idx >= self.defs.len() {
             return u32::MAX;
         }
+        if let Some(h) = self.memo[idx] {
+            return h;
+        }
+        if self.busy[idx] {
+            return u32::MAX;
+        }
+        self.busy[idx] = true;
         let p = self.p;
-        let h = match self.defs.get(&v).copied() {
+        let h = match self.defs[idx] {
             Some(Def::Phi(b, i)) => {
                 let block = &p.blocks[b];
                 let mut h = 0;
@@ -176,14 +238,15 @@ impl Ranges<'_> {
             }
             None => u32::MAX,
         };
-        self.busy.remove(&v);
-        self.memo.insert(v, h);
+        self.busy[idx] = false;
+        self.memo[idx] = Some(h);
         h
     }
 
     /// The largest value `a` has in lanes going from `pred` to `to`.
     fn edge_hi(&mut self, a: Value, pred: usize, to: usize) -> u32 {
-        let mut facts = vec![(self.st.reach[pred], true)];
+        let mut facts_buf = [(self.st.reach[pred], true); 2];
+        let mut n = 1;
         if let LaneExit::Branch {
             when,
             taken,
@@ -191,8 +254,10 @@ impl Ranges<'_> {
         } = self.st.exits[pred]
             && taken != not_taken
         {
-            facts.push((when, taken == to));
+            facts_buf[1] = (when, taken == to);
+            n = 2;
         }
+        let facts = &facts_buf[..n];
         let mut atoms: Vec<Atom> = facts
             .iter()
             .flat_map(|&(f, _)| self.st.bools.support(f))
@@ -203,7 +268,7 @@ impl Ranges<'_> {
             let (Atom::Lane(c) | Atom::Uniform(c)) = atom else {
                 continue;
             };
-            if let Some(holds) = self.st.bools.decides(&facts, atom)
+            if let Some(holds) = self.st.bools.decides(facts, atom)
                 && let Some(h) = self.compare_bound(c, a, holds)
             {
                 best = best.min(h);
@@ -215,7 +280,7 @@ impl Ranges<'_> {
     /// What an unsigned compare whose result `c` is `holds` says of the
     /// largest value of its operand `a`.
     fn compare_bound(&mut self, c: Value, a: Value, holds: bool) -> Option<u32> {
-        let Some(&Def::Inst(b, i)) = self.defs.get(&c) else {
+        let Some(Def::Inst(b, i)) = self.defs.get(c.0 as usize).copied().flatten() else {
             return None;
         };
         let p = self.p;
@@ -274,8 +339,14 @@ impl Ranges<'_> {
             Fields::Sop { src, .. } => src,
             _ => return u32::MAX,
         };
-        let s: Vec<u32> = src.iter().map(|o| self.operand_hi(inst, o)).collect();
-        match (inst.name(), &s[..]) {
+        if src.len() > 3 {
+            return u32::MAX;
+        }
+        let mut s = [0u32; 3];
+        for (slot, o) in s.iter_mut().zip(src.iter()) {
+            *slot = self.operand_hi(inst, o);
+        }
+        match (inst.name(), &s[..src.len()]) {
             ("s_mov_b32" | "v_mov_b32" | "v_readfirstlane_b32", &[x]) => x,
             ("s_min_u32" | "v_min_u32" | "s_and_b32" | "v_and_b32", &[x, y]) => x.min(y),
             ("s_max_u32" | "v_max_u32", &[x, y]) => x.max(y),
@@ -470,6 +541,45 @@ mod tests {
                 reads[..],
                 "{narrow_first}"
             );
+        }
+    }
+
+    #[test]
+    fn relative_opcode_fast_path_matches_names() {
+        // Verify VOP1 and VOP3-encoded VOP1 opcodes against the exact 5 names.
+        for op in 0..=0x7Fu32 {
+            let vop1_code: Vec<u8> = [vop1(op, 1, V), S_ENDPGM]
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            if let Ok(decoded) = crate::gfx10::decode(&vop1_code)
+                && let Some(first) = decoded.first()
+                && first.encoding == Encoding::Vop1
+            {
+                let by_name = matches!(
+                    first.name(),
+                    Some(
+                        "v_movrels_b32"
+                            | "v_movreld_b32"
+                            | "v_movrelsd_b32"
+                            | "v_movrelsd_2_b32"
+                            | "v_swaprel_b32"
+                    )
+                );
+                assert_eq!(
+                    relative_opcode(first.encoding, first.opcode),
+                    by_name,
+                    "VOP1 {op:#x} ({:?})",
+                    first.name()
+                );
+                assert_eq!(
+                    relative_opcode(Encoding::Vop3, first.opcode + 0x180),
+                    by_name,
+                    "VOP3-VOP1 {:#x} ({:?})",
+                    first.opcode + 0x180,
+                    first.name()
+                );
+            }
         }
     }
 }
