@@ -21,6 +21,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+#[cfg(test)]
+mod packed_mod_tests;
 
 type Why = &'static str;
 
@@ -7308,8 +7310,13 @@ impl<'a> Lower<'a> {
             | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
             _ => return Err("a packed 16-bit operation"),
         };
-        if v.omod != 0 || !float && (v.clamp || v.neg != 0 || v.neg_hi != 0) {
-            return Err("modifiers on a packed integer operation");
+        if v.omod != 0
+            || v.sdwa.is_some()
+            || v.abs != 0
+            || (op == "fmac_f16" && (v.neg != 0 || v.opsel != 0))
+            || !float && (v.clamp || v.neg != 0 || v.neg_hi != 0)
+        {
+            return Err("modifiers on a packed 16-bit operation");
         }
         let c = self.cur;
         let f32t = self.s.t.f32;
