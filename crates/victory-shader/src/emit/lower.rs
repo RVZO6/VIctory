@@ -13,7 +13,7 @@ use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
 use crate::ShaderError;
-use crate::gfx10::{Dpp, Fields, NULL, Operand};
+use crate::gfx10::{Dpp, Encoding, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
 use crate::ir::{Block, EXEC, Exit, Inst, Phi, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
@@ -21,6 +21,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod tables;
+use tables::{DenseMap, FxMap, FxSet, value_count};
 
 type Why = &'static str;
 
@@ -186,45 +188,45 @@ struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
-    lane_fail: HashMap<Value, Why>,
-    vals: HashMap<Value, Val>,
-    floats: HashMap<Value, V>,
+    lane_fail: FxMap<Value, Why>,
+    vals: DenseMap<Val>,
+    floats: DenseMap<V>,
     /// Values (missing in `vals`) whose low 16 bits are known: a 16-bit
     /// result written over a value with no DXIL form keeps its high half.
-    low16: HashMap<Value, V>,
+    low16: FxMap<Value, V>,
     /// DXIL block per IR block (unreachable: none).
     block: Vec<Option<usize>>,
     cur: usize,
-    bools: HashMap<(usize, Bool), V>,
-    lane_bits: HashMap<Value, V>,
+    bools: FxMap<(usize, Bool), V>,
+    lane_bits: FxMap<Value, V>,
     /// IR phi location by value.
-    phi_at: HashMap<Value, (usize, usize)>,
-    mask_phis: HashMap<Value, V>,
+    phi_at: DenseMap<(usize, usize)>,
+    mask_phis: FxMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
-    read_phis: HashSet<Value>,
-    params: HashMap<Value, (usize, u32)>,
+    read_phis: FxSet<Value>,
+    params: FxMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     /// Handles of root SRVs and UAVs read as bounded views, by user-data
     /// dword ([`Lower::root_view`]).
-    root_views: HashMap<u32, V>,
+    root_views: FxMap<u32, V>,
     samplers: Vec<[u32; 4]>,
-    descriptors: HashMap<(Site, bool), &'a Source>,
-    scalar: HashMap<Site, Address>,
-    exports: HashMap<Site, &'a Export>,
-    interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    descriptors: FxMap<(Site, bool), &'a Source>,
+    scalar: FxMap<Site, Address>,
+    exports: FxMap<Site, &'a Export>,
+    interps: FxMap<Site, &'a Interp>,
+    handles: FxMap<(usize, Site, u8, bool, u32), V>,
     /// Handles made in the entry block for descriptors at addresses the
     /// root parameters alone give (table and heap loads with no other
     /// term), by base value, byte offset, dword, offset register, sampler
     /// heap and properties ([`Lower::entry_address`]).
-    entry_handles: HashMap<(EntryAddress, u8, bool, u32), V>,
+    entry_handles: FxMap<(EntryAddress, u8, bool, u32), V>,
     /// Handles of descriptors chosen by control flow, made in their join
     /// block, by the choice (its `Debug` text), sampler heap and properties.
-    join_handles: HashMap<(String, bool, u32), V>,
+    join_handles: FxMap<(String, bool, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
-    edges: HashMap<(usize, usize), usize>,
+    edges: FxMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
@@ -250,7 +252,7 @@ struct Lower<'a> {
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
-    no_barrier: HashSet<usize>,
+    no_barrier: FxSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
     half_outputs: HashMap<u8, bool>,
@@ -259,19 +261,19 @@ struct Lower<'a> {
     /// The instruction being lowered may read lane masks as data.
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
-    ballots: HashMap<Value, (V, V)>,
+    ballots: FxMap<Value, (V, V)>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
-    balloting: HashSet<Value>,
+    balloting: FxSet<Value>,
     /// Block writing each value.
     def_block: HashMap<Value, usize>,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
-    sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
+    sections: FxMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
-    section_out: HashSet<Value>,
+    section_out: FxSet<Value>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -288,7 +290,11 @@ struct Lower<'a> {
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
 /// after `inst`, from `mode` before it (`None`: not known).
+#[inline]
 fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
+    if !matches!(inst.machine.encoding, Encoding::Sopp | Encoding::Sopk) {
+        return mode;
+    }
     match (inst.name(), &inst.fields) {
         ("s_round_mode", Fields::Sopp { imm }) => Some((imm >> 2 & 3) as u8),
         (
@@ -316,6 +322,18 @@ fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
 /// program's start, then as the MODE writes on the way set it; `None` where
 /// paths that set it differently join (or a write is not a constant).
 fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
+    let sets_mode = p.blocks.iter().any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(i.machine.encoding, Encoding::Sopp | Encoding::Sopk)
+                && matches!(
+                    i.name(),
+                    "s_round_mode" | "s_setreg_imm32_b32" | "s_setreg_b32"
+                )
+        })
+    });
+    if !sets_mode {
+        return vec![Some(0); p.blocks.len()];
+    }
     // None: not reached yet; Some(m): the mode (m None: not known).
     let mut entry: Vec<Option<Option<u8>>> = vec![None; p.blocks.len()];
     entry[0] = Some(Some(0));
@@ -398,7 +416,7 @@ const LANE_MASK: Why = "a lane mask read as data";
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
-    let ops: Vec<&Operand> = match &i.fields {
+    let ops: &[Operand] = match &i.fields {
         // A mask operation (its result a mask) is no data use.
         Fields::Sop { .. }
             if i.writes
@@ -407,15 +425,15 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
         {
             return false;
         }
-        Fields::Sop { src, .. } => src.iter().collect(),
+        Fields::Sop { src, .. } => src,
         Fields::Valu(v)
             if !matches!(i.name(), "v_cndmask_b32") && !i.name().contains("_co_ci_") =>
         {
-            v.src.iter().collect()
+            &v.src
         }
         _ => return false,
     };
-    ops.into_iter().any(|op| match *op {
+    ops.iter().any(|op| match *op {
         Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
         _ => false,
     })
@@ -543,7 +561,8 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
-        let mut phi_at = HashMap::new();
+        let nvals = value_count(p);
+        let mut phi_at = DenseMap::with_capacity(nvals);
         for (b, block) in p.blocks.iter().enumerate() {
             for (i, phi) in block.phis.iter().enumerate() {
                 phi_at.insert(phi.value, (b, i));
@@ -604,7 +623,7 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
             }
         }
-        let mut no_barrier = HashSet::new();
+        let mut no_barrier = FxSet::default();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
@@ -653,23 +672,23 @@ impl<'a> Lower<'a> {
             s,
             x,
             bad,
-            lane_fail: HashMap::new(),
-            vals: HashMap::new(),
-            floats: HashMap::new(),
-            low16: HashMap::new(),
+            lane_fail: FxMap::default(),
+            vals: DenseMap::with_capacity(nvals),
+            floats: DenseMap::with_capacity(nvals),
+            low16: FxMap::default(),
             block: vec![None; p.blocks.len()],
             cur: 0,
-            bools: HashMap::new(),
-            lane_bits: HashMap::new(),
+            bools: FxMap::default(),
+            lane_bits: FxMap::default(),
             phi_at,
-            mask_phis: HashMap::new(),
+            mask_phis: FxMap::default(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
-            read_phis: HashSet::new(),
+            read_phis: FxSet::default(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
-            root_views: HashMap::new(),
+            root_views: FxMap::default(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -680,10 +699,10 @@ impl<'a> Lower<'a> {
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
-            handles: HashMap::new(),
-            entry_handles: HashMap::new(),
-            join_handles: HashMap::new(),
-            edges: HashMap::new(),
+            handles: FxMap::default(),
+            entry_handles: FxMap::default(),
+            join_handles: FxMap::default(),
+            edges: FxMap::default(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
@@ -703,8 +722,8 @@ impl<'a> Lower<'a> {
                 _ => MaskData::None,
             },
             mask_ok: false,
-            ballots: HashMap::new(),
-            balloting: HashSet::new(),
+            ballots: FxMap::default(),
+            balloting: FxSet::default(),
             def_block: p
                 .blocks
                 .iter()
@@ -718,8 +737,8 @@ impl<'a> Lower<'a> {
                 })
                 .collect(),
             cur_ir: 0,
-            sections: HashMap::new(),
-            section_out: HashSet::new(),
+            sections: FxMap::default(),
+            section_out: FxSet::default(),
             code_table: None,
             counters: HashMap::new(),
             abort: None,
@@ -1353,8 +1372,12 @@ impl<'a> Lower<'a> {
             }
             let mut i = 0;
             self.mode16 = self.round16[b];
+            let has_discards = !self.x.st.discards.is_empty();
+            let has_sections = self.sections.contains_key(&b);
             while i < p.blocks[b].insts.len() {
-                if let Some(&lanes) = self.x.st.discards.get(&(b, i)) {
+                if has_discards
+                    && let Some(&lanes) = self.x.st.discards.get(&(b, i))
+                {
                     // A pixel's discard: the lanes stay on as helpers.
                     let at = self.cur;
                     let offset = p.blocks[b].insts[i].machine.offset;
@@ -1366,7 +1389,9 @@ impl<'a> Lower<'a> {
                 }
                 self.inst(b, i)?;
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
-                if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
+                if has_sections
+                    && let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end)
+                {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
                     }
@@ -1635,14 +1660,23 @@ impl<'a> Lower<'a> {
         if self.phi_at.contains_key(&v) {
             self.read_phis.insert(v);
         }
-        let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
         match self.vals.get(&v) {
-            Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
-                return self.mask_dword(v).map(Val::I32);
+            Some(&Val::Missing(w)) => {
+                if self.mask_ok
+                    && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v))
+                {
+                    return self.mask_dword(v).map(Val::I32);
+                }
+                return Err(w);
             }
-            Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
-            None => {}
+            None => {
+                if self.mask_ok
+                    && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v))
+                {
+                    return self.mask_dword(v).map(Val::I32);
+                }
+            }
         }
         if let Some(&(param, dword)) = self.params.get(&v) {
             let val = self.user(param, dword);
@@ -3506,25 +3540,21 @@ impl<'a> Lower<'a> {
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
             MaskData::Host => {
-                name.starts_with("s_bcnt1_i32_")
+                matches!(
+                    inst.machine.encoding,
+                    Encoding::Sop1 | Encoding::Sopc | Encoding::Vop3
+                ) && (name.starts_with("s_bcnt1_i32_")
                     || name.starts_with("s_ff1_i32_")
                     || name.starts_with("v_mbcnt_")
                     || matches!(
                         name,
                         "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_eq_u64" | "s_cmp_lg_u64"
-                    )
+                    ))
             }
-            MaskData::None => name == "s_bcnt1_i32_b64",
+            MaskData::None => {
+                inst.machine.encoding == Encoding::Sop1 && name == "s_bcnt1_i32_b64"
+            }
         };
-        let effect = matches!(inst.fields, Fields::Exp { .. })
-            || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
-            || name.contains("store")
-            || name.contains("atomic")
-            || name == "s_barrier"
-            || matches!(inst.fields, Fields::Ds { .. })
-                && !(name.starts_with("ds_read")
-                    || name.starts_with("ds_swizzle")
-                    || name.contains("permute"));
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -3553,8 +3583,20 @@ impl<'a> Lower<'a> {
         };
         match r {
             Ok(()) => Ok(()),
-            Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
+                let effect = matches!(inst.fields, Fields::Exp { .. })
+                    || matches!(inst.fields, Fields::Flat { .. })
+                        && !name.starts_with("global_load_")
+                    || name.contains("store")
+                    || name.contains("atomic")
+                    || name == "s_barrier"
+                    || matches!(inst.fields, Fields::Ds { .. })
+                        && !(name.starts_with("ds_read")
+                            || name.starts_with("ds_swizzle")
+                            || name.contains("permute"));
+                if effect {
+                    return Err(unsupported(offset, why));
+                }
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }
@@ -6901,6 +6943,9 @@ impl<'a> Lower<'a> {
     /// products are exact there and round once to f16 (f32 has the 2 x 11 +
     /// 2 bits that make double rounding harmless); `None` if `name` is none.
     fn valu16(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Option<Result<(), Why>> {
+        if !name.ends_with("16") && name != "v_cvt_f16_f32" {
+            return None;
+        }
         const FLOAT2: &[&str] = &[
             "v_add_f16",
             "v_sub_f16",
@@ -9396,30 +9441,29 @@ impl<'a> Lower<'a> {
         };
         // d16: two 16-bit channels per VGPR, low half first (buffer and
         // tbuffer formats alike).
-        let d16 = name.contains("_format_d16_");
-        let plain = name.replace("_format_d16_", "_format_");
-        let (typed, count) = match plain
+        let rest = name
             .strip_prefix("buffer_load_")
-            .or(plain.strip_prefix("buffer_store_"))
-            .or(plain.strip_prefix("tbuffer_load_"))
-        {
+            .or_else(|| name.strip_prefix("buffer_store_"))
+            .or_else(|| name.strip_prefix("tbuffer_load_"));
+        let d16 = rest.is_some_and(|s| s.starts_with("format_d16_"));
+        let (typed, count) = match rest {
             _ if atomic.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
             Some("dwordx4") => (false, 4),
-            Some("format_x") => (true, 1),
-            Some("format_xy") => (true, 2),
-            Some("format_xyz") => (true, 3),
-            Some("format_xyzw") => (true, 4),
+            Some("format_x" | "format_d16_x") => (true, 1),
+            Some("format_xy" | "format_d16_xy") => (true, 2),
+            Some("format_xyz" | "format_d16_xyz") => (true, 3),
+            Some("format_xyzw" | "format_d16_xyzw") => (true, 4),
             Some("ubyte" | "sbyte" | "ushort" | "sshort") if !store => (false, 1),
             Some("byte" | "short") if store => (false, 1),
             _ => return Err(name),
         };
         // Loads or stores of a byte or a half: its width and whether signed.
-        let sub = match plain
+        let sub = match name
             .strip_prefix("buffer_load_")
-            .or(plain.strip_prefix("buffer_store_"))
+            .or_else(|| name.strip_prefix("buffer_store_"))
         {
             Some("ubyte" | "byte") => Some((8, false)),
             Some("sbyte") => Some((8, true)),
