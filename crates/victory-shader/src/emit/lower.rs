@@ -25,6 +25,8 @@ mod bvh;
 mod cbv_subdword_tests;
 #[cfg(test)]
 mod typed_store_tests;
+#[cfg(all(test, windows))]
+mod cube_resinfo_tests;
 
 type Why = &'static str;
 
@@ -8695,7 +8697,11 @@ impl<'a> Lower<'a> {
                 return Err("an image result");
             };
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                let x = if ch == 3 && uav || !present[ch as usize] {
+                let x = if kind == 5 && ch == 2 {
+                    // GCN3 §12.16 / RDNA3 §10.1 / LLPC / RADV / gfx1031:
+                    // cubemap resinfo reports face count (6), not 1.
+                    self.s.m.i32(6)
+                } else if ch == 3 && uav || !present[ch as usize] {
                     one
                 } else {
                     self.s.m.extract(c, d, ch)
