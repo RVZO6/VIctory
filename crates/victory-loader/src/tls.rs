@@ -76,9 +76,19 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
 /// Rewrites each `mov r64, gs:[0x58]` in `code` (at address `at`) as
 /// `call thunks[r]; nop4`. `thunks` must be within 2 GiB of `code`.
 fn patch(code: &mut [u8], at: usize, thunks: usize) -> usize {
+    const NEEDLE: [u8; 5] = [0x25, 0x58, 0, 0, 0];
+    if code.len() < LOAD_LEN {
+        return 0;
+    }
+    let finder = memchr::memmem::Finder::new(&NEEDLE);
     let mut count = 0;
-    let mut i = 0;
-    while i + LOAD_LEN <= code.len() {
+    let mut pos = 4;
+    while pos + NEEDLE.len() <= code.len() {
+        let Some(rel_hit) = finder.find(&code[pos..]) else {
+            break;
+        };
+        let hit = pos + rel_hit;
+        let i = hit - 4;
         let c = &code[i..i + LOAD_LEN];
         let rex = c[1];
         let reg = usize::from((c[3] >> 3) & 7) | if rex & 4 != 0 { 8 } else { 0 };
@@ -89,7 +99,6 @@ fn patch(code: &mut [u8], at: usize, thunks: usize) -> usize {
             && (rex == 0x48 || rex == 0x4C)
             && c[2] == 0x8B
             && c[3] & 0xC7 == 0x04
-            && c[4..] == [0x25, 0x58, 0, 0, 0]
             && reg != 4
         {
             let rel = (thunks + reg * THUNK_SIZE) as i64 - (at + i + 5) as i64;
@@ -97,9 +106,9 @@ fn patch(code: &mut [u8], at: usize, thunks: usize) -> usize {
             code[i + 1..i + 5].copy_from_slice(&(rel as i32).to_le_bytes());
             code[i + 5..i + 9].copy_from_slice(&[0x0F, 0x1F, 0x40, 0x00]);
             count += 1;
-            i += LOAD_LEN;
+            pos = i + LOAD_LEN + 4;
         } else {
-            i += 1;
+            pos = hit + 1;
         }
     }
     count
@@ -215,5 +224,93 @@ mod tests {
             // SAFETY: our page again.
             unsafe { VirtualProtect(page as _, 4096, PAGE_READWRITE, &mut old) };
         }
+    }
+
+    #[test]
+    fn memmem_patch_matches_bytewise_oracle() {
+        fn oracle(code: &mut [u8], at: usize, thunks: usize) -> usize {
+            let mut count = 0;
+            let mut i = 0;
+            while i + LOAD_LEN <= code.len() {
+                let c = &code[i..i + LOAD_LEN];
+                let rex = c[1];
+                let reg = usize::from((c[3] >> 3) & 7) | if rex & 4 != 0 { 8 } else { 0 };
+                if c[0] == 0x65
+                    && (rex == 0x48 || rex == 0x4C)
+                    && c[2] == 0x8B
+                    && c[3] & 0xC7 == 0x04
+                    && c[4..] == [0x25, 0x58, 0, 0, 0]
+                    && reg != 4
+                {
+                    let rel = (thunks + reg * THUNK_SIZE) as i64 - (at + i + 5) as i64;
+                    code[i] = 0xE8;
+                    code[i + 1..i + 5].copy_from_slice(&(rel as i32).to_le_bytes());
+                    code[i + 5..i + 9].copy_from_slice(&[0x0F, 0x1F, 0x40, 0x00]);
+                    count += 1;
+                    i += LOAD_LEN;
+                } else {
+                    i += 1;
+                }
+            }
+            count
+        }
+
+        // Cover empty/short buffers, boundary hits at index 0 and end, back-to-back
+        // hits, near-misses (wrong prefix, rsp reg==4, lone needle), and all 15 valid regs.
+        let mut buf = Vec::new();
+        buf.extend([0x25, 0x58, 0, 0, 0]); // needle at offset 0 (< 4)
+        buf.extend([0x65, 0x48, 0x8B, 0x24, 0x25, 0x58, 0, 0, 0]); // reg == 4 (rsp) -> skipped
+        buf.extend([0x65, 0x49, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]); // wrong REX -> skipped
+        buf.extend([0x66, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]); // wrong segment -> skipped
+        for reg in 0..16u8 {
+            let rex = 0x48 | ((reg >> 3) << 2);
+            let modrm = ((reg & 7) << 3) | 4;
+            buf.extend([0x65, rex, 0x8B, modrm, 0x25, 0x58, 0, 0, 0]);
+        }
+        // Trailing needle at exact end.
+        buf.extend([0x90, 0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0]);
+
+        for slice in [&[][..], &[0x25, 0x58, 0, 0, 0][..], &buf[..], &buf[..buf.len() - 1]] {
+            let (mut a, mut b) = (slice.to_vec(), slice.to_vec());
+            let ca = patch(&mut a, 0x1000_0000, 0x1001_0000);
+            let cb = oracle(&mut b, 0x1000_0000, 0x1001_0000);
+            assert_eq!(ca, cb);
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_tls_patch_64mb() {
+        // 64 MiB synthetic .text with 32,768 TLS loads (proportional to GTA VI's
+        // ~100 MiB .text / 53,246 hits) plus near-miss decoys.
+        const LEN: usize = 64 << 20;
+        let mut template = vec![0x90u8; LEN];
+        let mut expected = 0usize;
+        for k in 0..32_768usize {
+            let off = k * 2048 + 13;
+            let reg = (k % 15) as u8;
+            let reg = if reg >= 4 { reg + 1 } else { reg };
+            let rex = 0x48 | ((reg >> 3) << 2);
+            let modrm = ((reg & 7) << 3) | 4;
+            template[off..off + LOAD_LEN]
+                .copy_from_slice(&[0x65, rex, 0x8B, modrm, 0x25, 0x58, 0, 0, 0]);
+            expected += 1;
+            // Near-miss decoy with 0x65 prefix.
+            template[off + 64..off + 68].copy_from_slice(&[0x65, 0x48, 0x8B, 0x04]);
+        }
+        let mut buf = template.clone();
+        assert_eq!(patch(&mut buf, 0x1_4000_0000, 0x1_4500_0000), expected);
+
+        let mut best_ms = f64::INFINITY;
+        for _ in 0..3 {
+            buf.copy_from_slice(&template);
+            let t0 = std::time::Instant::now();
+            let n = patch(&mut buf, 0x1_4000_0000, 0x1_4500_0000);
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            assert_eq!(n, expected);
+            best_ms = best_ms.min(ms);
+        }
+        eprintln!("tls::patch (64 MiB, {expected} hits): {best_ms:.2} ms");
     }
 }
