@@ -21,6 +21,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+#[cfg(all(test, windows))]
+mod cbv_subdword_tests;
 
 type Why = &'static str;
 
@@ -4905,6 +4907,21 @@ impl<'a> Lower<'a> {
         x
     }
 
+    /// Extracts an 8- or 16-bit lane at byte address `byte` from its
+    /// containing 32-bit dword `w`, zero- or sign-extending to 32 bits.
+    fn extract_sub(&mut self, w: V, byte: V, width: u32, signed: bool) -> V {
+        let c = self.cur;
+        let three = self.s.m.i32(3);
+        let off = self.s.m.bin(c, Bin::And, byte, three);
+        let sh = self.s.m.bin(c, Bin::Shl, off, three);
+        let x = self.s.m.bin(c, Bin::LShr, w, sh);
+        let left = self.s.m.i32(32 - width);
+        let x = self.s.m.bin(c, Bin::Shl, x, left);
+        self.s
+            .m
+            .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left)
+    }
+
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
@@ -9479,6 +9496,9 @@ impl<'a> Lower<'a> {
             (_, ix) => ix,
         };
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
+            if store || atomic.is_some() {
+                return Err("a store or atomic on a constant buffer");
+            }
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
@@ -9491,32 +9511,50 @@ impl<'a> Lower<'a> {
                 }
                 None => off,
             };
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
             if table {
                 // A table's constant buffer is a raw view (scalar loads above).
-                let Some(Operand::Vector { reg, .. }) = *data else {
-                    return Err("a buffer result");
+                let load_at = if sub.is_some() {
+                    let not3 = self.s.m.i32(!3);
+                    self.s.m.bin(c, Bin::And, byte, not3)
+                } else {
+                    byte
                 };
-                let (h, byte) = self.raw_view(site, src, byte, 4 * count, (11, 0), false, guard)?;
+                let (h, load_at) =
+                    self.raw_view(site, src, load_at, 4 * count, (11, 0), false, guard)?;
+                let c = self.cur;
                 for k in 0..count {
                     let four = self.s.m.i32(4 * k);
-                    let a = self.s.m.bin(c, Bin::Add, byte, four);
+                    let a = self.s.m.bin(c, Bin::Add, load_at, four);
                     let (mask, al) = (self.s.m.i8(1), self.s.m.i32(4));
                     let u = self.s.m.undef(self.s.t.i32);
-                    let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[h, a, u, mask, al]);
+                    let r = self.s.op(
+                        c,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[h, a, u, mask, al],
+                    );
                     let x = self.s.m.extract(c, r, 0);
-                    let x = self.as_int(x);
+                    let mut x = self.as_int(x);
+                    if let Some((width, signed)) = sub {
+                        x = self.extract_sub(x, byte, width, signed);
+                    }
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
                 }
                 return Ok(());
             }
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
-            let Some(Operand::Vector { reg, .. }) = *data else {
-                return Err("a buffer result");
-            };
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
+                let mut x = self.cbuffer_dword(h, a);
+                if let Some((width, signed)) = sub {
+                    x = self.extract_sub(x, a, width, signed);
+                }
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -9750,7 +9788,7 @@ impl<'a> Lower<'a> {
             if index.is_some() {
                 return Err("a byte or half buffer load by index");
             }
-            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+            let not3 = self.s.m.i32(!3);
             let at = self.s.m.bin(c, Bin::And, off, not3);
             let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), false, guard)?;
             let c = self.cur;
@@ -9765,15 +9803,7 @@ impl<'a> Lower<'a> {
             );
             let w = self.s.m.extract(c, r, 0);
             let w = self.as_int(w);
-            let byte = self.s.m.bin(c, Bin::And, off, three);
-            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-            let x = self.s.m.bin(c, Bin::LShr, w, sh);
-            let left = self.s.m.i32(32 - width);
-            let x = self.s.m.bin(c, Bin::Shl, x, left);
-            let x = self
-                .s
-                .m
-                .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left);
+            let x = self.extract_sub(w, off, width, signed);
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
