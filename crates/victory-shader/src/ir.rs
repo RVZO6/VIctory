@@ -176,16 +176,17 @@ pub fn build_bounded(
             exit: Exit::End,
         })
         .collect();
-    let next_offsets: Vec<Option<usize>> = (0..list.len())
-        .map(|i| list.get(i + 1).map(|n| n.offset))
-        .collect();
-    for ((machine, flow), next) in list.into_iter().zip(flows).zip(next_offsets) {
-        let b = leaders.partition_point(|&l| l <= machine.offset) - 1;
+    let mut b = 0usize;
+    let mut iter = list.into_iter().zip(flows).peekable();
+    while let Some((machine, flow)) = iter.next() {
+        while leaders.get(b + 1).is_some_and(|&l| l <= machine.offset) {
+            b += 1;
+        }
+        let next = iter.peek().map(|(n, _)| n.offset);
         let name = machine.name().ok_or(ShaderError::Unsupported {
             offset: machine.offset,
             what: "unknown opcode",
         })?;
-        let fields = machine.fields(wave64);
         let fallthrough = || block_at(next.ok_or(isa(machine.offset, "falls off the code"))?);
         // A conditional SOPP branch to fallthrough has no register effects
         // and contributes one edge to the join. Calls also use Flow::Branch
@@ -196,7 +197,7 @@ pub fn build_bounded(
             blocks[b].exit = Exit::Jump(fallthrough()?);
             continue;
         }
-        let ends = flow != Flow::Next || next.is_none_or(|n| leaders.binary_search(&n).is_ok());
+        let ends = flow != Flow::Next || next.is_none_or(|n| leaders.get(b + 1) == Some(&n));
         if ends {
             blocks[b].exit = match flow {
                 Flow::Next => Exit::Jump(fallthrough()?),
@@ -209,6 +210,10 @@ pub fn build_bounded(
                 Flow::Stop => Exit::End,
             };
         }
+        if is_dropped(machine.encoding, machine.opcode) {
+            continue;
+        }
+        let fields = machine.fields(wave64);
         let m0 = m0_max.get(&machine.offset).copied();
         if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs, m0)? {
             blocks[b].insts.push(Inst {
@@ -229,62 +234,8 @@ pub fn build_bounded(
     split_irreducible(&mut blocks)?;
 
     let order = reverse_postorder(&blocks);
-    let (live_in, live_out) = liveness(&blocks, &order);
-    let mut values = 0u32;
-    let mut new_value = || {
-        values += 1;
-        Value(values - 1)
-    };
-    let mut inputs = Vec::new();
-    let mut outs: Vec<Vec<(Reg, Value)>> = vec![Vec::new(); blocks.len()];
-    let mut current = [NONE; REGS];
-    for &b in &order {
-        current.fill(NONE);
-        let block = &mut blocks[b];
-        for reg in members(&live_in[b]) {
-            current[index(reg)] = match block.preds[..] {
-                [] => {
-                    let v = new_value();
-                    inputs.push((reg, v));
-                    v
-                }
-                // A single predecessor comes earlier in reverse postorder.
-                [p] => lookup(&outs[p], reg),
-                _ => {
-                    let value = new_value();
-                    block.phis.push(Phi {
-                        reg,
-                        value,
-                        args: Vec::new(),
-                    });
-                    value
-                }
-            };
-        }
-        for inst in &mut block.insts {
-            for (reg, v) in &mut inst.reads {
-                *v = current[index(*reg)];
-                debug_assert_ne!(*v, NONE, "{reg:?} read at {:#x}", inst.machine.offset);
-            }
-            for (reg, v) in &mut inst.writes {
-                *v = new_value();
-                current[index(*reg)] = *v;
-            }
-        }
-        outs[b] = members(&live_out[b])
-            .map(|reg| (reg, current[index(reg)]))
-            .collect();
-    }
-    for block in &mut blocks {
-        for phi in &mut block.phis {
-            phi.args = block
-                .preds
-                .iter()
-                .map(|&p| lookup(&outs[p], phi.reg))
-                .collect();
-            debug_assert!(!phi.args.contains(&NONE), "{phi:?}");
-        }
-    }
+    let (live_in, defs) = liveness(&blocks, &order);
+    let (inputs, values) = build_pruned_ssa(&mut blocks, &order, &live_in, defs);
     remove_trivial_phis(&mut blocks, values);
     Ok(Program {
         wave64,
@@ -292,6 +243,183 @@ pub fn build_bounded(
         blocks,
         inputs,
     })
+}
+
+/// Pruned SSA construction via bitset iterated dominance frontiers and
+/// single-pass dominator-tree DFS renaming.
+fn build_pruned_ssa(
+    blocks: &mut [Block],
+    order: &[usize],
+    live_in: &[RegSet],
+    defs: Vec<RegSet>,
+) -> (Vec<(Reg, Value)>, u32) {
+    let n = blocks.len();
+    let empty: RegSet = [0; REGS.div_ceil(64)];
+    let mut rpo_idx = vec![usize::MAX; n];
+    for (pos, &b) in order.iter().enumerate() {
+        rpo_idx[b] = pos;
+    }
+    let idom = idoms(blocks, order, &rpo_idx);
+
+    // Dominator-tree children (in RPO order) and dominance frontiers.
+    let mut dom_children = vec![Vec::new(); n];
+    let mut df: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &b in order {
+        if b != 0 && idom[b] != usize::MAX {
+            dom_children[idom[b]].push(b);
+        }
+        if blocks[b].preds.len() >= 2 {
+            for &p in &blocks[b].preds {
+                if rpo_idx[p] == usize::MAX {
+                    continue;
+                }
+                let mut runner = p;
+                while runner != idom[b] && runner != usize::MAX {
+                    if !df[runner].contains(&b) {
+                        df[runner].push(b);
+                    }
+                    runner = idom[runner];
+                }
+            }
+        }
+    }
+
+    // Parallel bitset IDF: propagate all 385 registers simultaneously.
+    let mut phi_regs = vec![empty; n];
+    let mut work_bits = defs;
+    let mut queue = Vec::with_capacity(order.len());
+    let mut in_queue = vec![false; n];
+    for &b in order {
+        if work_bits[b] != empty && !df[b].is_empty() {
+            queue.push(b);
+            in_queue[b] = true;
+        }
+    }
+    let mut head = 0;
+    while head < queue.len() {
+        let b = queue[head];
+        head += 1;
+        in_queue[b] = false;
+        let bits = work_bits[b];
+        work_bits[b] = empty;
+        for &y in &df[b] {
+            let mut added = false;
+            for w in 0..empty.len() {
+                let new = bits[w] & live_in[y][w] & !phi_regs[y][w];
+                if new != 0 {
+                    phi_regs[y][w] |= new;
+                    work_bits[y][w] |= new;
+                    added = true;
+                }
+            }
+            if added && !in_queue[y] && !df[y].is_empty() {
+                queue.push(y);
+                in_queue[y] = true;
+            }
+        }
+    }
+
+    // Pre-create pruned Phi shells (in Reg order) so predecessor edges can
+    // fill args during the single dominator-tree DFS pass.
+    for &b in order {
+        if phi_regs[b] != empty {
+            let n_preds = blocks[b].preds.len();
+            for reg in members(&phi_regs[b]) {
+                blocks[b].phis.push(Phi {
+                    reg,
+                    value: NONE,
+                    args: vec![NONE; n_preds],
+                });
+            }
+        }
+    }
+
+    let mut values = 0u32;
+    let mut new_value = || {
+        values += 1;
+        Value(values - 1)
+    };
+    let mut inputs = Vec::new();
+    let mut current = [NONE; REGS];
+    for reg in members(&live_in[0]) {
+        let v = new_value();
+        inputs.push((reg, v));
+        current[index(reg)] = v;
+    }
+
+    // Iterative dominator-tree DFS renaming with an undo trail.
+    enum Step {
+        Enter(usize),
+        Leave(usize),
+    }
+    let mut trail: Vec<(usize, Value)> = Vec::new();
+    let mut stack: Vec<Step> = Vec::with_capacity(order.len() * 2);
+    stack.push(Step::Enter(0));
+    while let Some(step) = stack.pop() {
+        match step {
+            Step::Leave(mark) => {
+                while trail.len() > mark {
+                    let (idx, old) = trail.pop().unwrap();
+                    current[idx] = old;
+                }
+            }
+            Step::Enter(b) => {
+                let mark = trail.len();
+                stack.push(Step::Leave(mark));
+                let block = &mut blocks[b];
+                for phi in &mut block.phis {
+                    let v = new_value();
+                    phi.value = v;
+                    let idx = index(phi.reg);
+                    trail.push((idx, current[idx]));
+                    current[idx] = v;
+                }
+                for inst in &mut block.insts {
+                    for (reg, v) in &mut inst.reads {
+                        *v = current[index(*reg)];
+                        debug_assert_ne!(*v, NONE, "{reg:?} read at {:#x}", inst.machine.offset);
+                    }
+                    for (reg, v) in &mut inst.writes {
+                        let nv = new_value();
+                        *v = nv;
+                        let idx = index(*reg);
+                        trail.push((idx, current[idx]));
+                        current[idx] = nv;
+                    }
+                }
+                let (s0, s1) = match block.exit {
+                    Exit::Jump(t) => (Some(t), None),
+                    Exit::Branch { taken, not_taken } => {
+                        (Some(taken), (not_taken != taken).then_some(not_taken))
+                    }
+                    Exit::End | Exit::Indirect => (None, None),
+                };
+                for s in [s0, s1].into_iter().flatten() {
+                    if !blocks[s].phis.is_empty() {
+                        let sb = &mut blocks[s];
+                        for (k, &pred) in sb.preds.iter().enumerate() {
+                            if pred == b {
+                                for phi in &mut sb.phis {
+                                    phi.args[k] = current[index(phi.reg)];
+                                }
+                            }
+                        }
+                    }
+                }
+                for &child in dom_children[b].iter().rev() {
+                    stack.push(Step::Enter(child));
+                }
+            }
+        }
+    }
+    #[cfg(debug_assertions)]
+    for block in blocks.iter() {
+        for phi in &block.phis {
+            debug_assert_ne!(phi.value, NONE, "{phi:?}");
+            debug_assert!(!phi.args.contains(&NONE), "{phi:?}");
+        }
+    }
+    (inputs, values)
 }
 
 /// Placeholder before renaming.
@@ -341,12 +469,6 @@ fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
         }
         bits = set[word];
     })
-}
-
-/// `outs` is sorted by register, and holds every register live out.
-fn lookup(outs: &[(Reg, Value)], reg: Reg) -> Value {
-    outs.binary_search_by_key(&reg, |&(r, _)| r)
-        .map_or(NONE, |i| outs[i].1)
 }
 
 pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
@@ -581,7 +703,7 @@ fn multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec
     None
 }
 
-/// Registers live into and out of each block.
+/// Registers live into each block and registers defined in each block.
 fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
     let empty = [0; REGS.div_ceil(64)];
     let mut uses = vec![empty; blocks.len()];
@@ -599,7 +721,6 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
         }
     }
     let mut live_in = vec![empty; blocks.len()];
-    let mut live_out = vec![empty; blocks.len()];
     let mut changed = true;
     while changed {
         changed = false;
@@ -614,22 +735,26 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
             for w in 0..inn.len() {
                 inn[w] = uses[b][w] | out[w] & !defs[b][w];
             }
-            if inn != live_in[b] || out != live_out[b] {
-                (live_in[b], live_out[b]) = (inn, out);
+            if inn != live_in[b] {
+                live_in[b] = inn;
                 changed = true;
             }
         }
     }
-    (live_in, live_out)
+    (live_in, defs)
 }
 
-/// Phis are placed for every live register at every join; those whose
-/// arguments are all one value (or the phi itself) are replaced by it.
+/// Removes any remaining trivial phis (whose arguments are all one value or
+/// the phi itself), replacing their uses with that value.
 fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
     remove_trivial_phis_steps(blocks, values);
 }
 
 fn remove_trivial_phis_steps(blocks: &mut [Block], values: u32) -> usize {
+    if !blocks.iter().any(|b| !b.phis.is_empty()) {
+        return 0;
+    }
+
     fn find(replaced: &mut [Value], v: Value, steps: &mut usize) -> Value {
         let mut root = v;
         while replaced[root.0 as usize] != root {
@@ -648,6 +773,7 @@ fn remove_trivial_phis_steps(blocks: &mut [Block], values: u32) -> usize {
 
     let mut replaced: Vec<Value> = (0..values).map(Value).collect();
     let mut steps = 0usize;
+    let mut removed = false;
     let mut changed = true;
     while changed {
         changed = false;
@@ -666,10 +792,14 @@ fn remove_trivial_phis_steps(blocks: &mut [Block], values: u32) -> usize {
                 }
                 let Some(v) = only else { return true };
                 replaced[phi.value.0 as usize] = v;
+                removed = true;
                 changed = true;
                 false
             });
         }
+    }
+    if !removed {
+        return steps;
     }
     for block in blocks {
         for phi in &mut block.phis {
@@ -686,7 +816,24 @@ fn remove_trivial_phis_steps(blocks: &mut [Block], values: u32) -> usize {
     steps
 }
 
+#[inline]
+fn is_dropped(encoding: gfx10::Encoding, opcode: u16) -> bool {
+    use gfx10::Encoding;
+    match encoding {
+        Encoding::Sopp => matches!(
+            opcode,
+            0x00 | 0x0C | 0x0E | 0x0F | 0x14..=0x16 | 0x20..=0x23 | 0x28
+        ),
+        Encoding::Sopk => matches!(opcode, 0x17..=0x1A),
+        Encoding::Vop1 => matches!(opcode, 0x00 | 0x1B | 0x41),
+        // VOP3 encodes VOP1 opcodes at 0x180..0x200.
+        Encoding::Vop3 => matches!(opcode, 0x180 | 0x19B | 0x1C1),
+        _ => false,
+    }
+}
+
 /// Scheduling hints, performance counters and tracing: no effect on results.
+#[cfg(test)]
 const DROPPED: &[&str] = &[
     "s_nop",
     "s_waitcnt",
@@ -723,9 +870,6 @@ fn effects(
     vgprs: u16,
     m0_max: Option<u8>,
 ) -> Result<Option<Effects>, ShaderError> {
-    if DROPPED.contains(&name) {
-        return Ok(None);
-    }
     let unsupported = || ShaderError::Unsupported {
         offset: inst.offset,
         what: name,
@@ -1477,5 +1621,302 @@ mod tests {
         assert_eq!(header.insts[0].read(Reg::S(2)), Some(lp_s2));
         assert_eq!(exit.insts[0].read(Reg::S(1)), Some(next_s1));
         assert_eq!(exit.insts[0].read(Reg::S(2)), Some(lp_s2));
+    }
+
+    #[test]
+    fn is_dropped_matches_dropped_names() {
+        use crate::gfx10::Encoding;
+        let check = |words: &[u32], enc: Encoding| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            if let Ok(decoded) = crate::gfx10::decode(&code)
+                && let Some(first) = decoded.first()
+                && first.encoding == enc
+                && let Some(nm) = first.name()
+            {
+                assert_eq!(
+                    is_dropped(first.encoding, first.opcode),
+                    DROPPED.contains(&nm),
+                    "{enc:?} {:#x} ({nm})",
+                    first.opcode
+                );
+            }
+        };
+        for op in 0..=0x3Fu32 {
+            // SOPP
+            check(&[0xBF80_0000 | (op << 16), S_ENDPGM], Encoding::Sopp);
+            // SOPK (include trailing literal word for s_setreg_imm32_b32)
+            check(&[0xB000_0000 | (op << 23), 0, S_ENDPGM], Encoding::Sopk);
+        }
+        for op in 0..=0x7Fu32 {
+            // VOP1
+            check(&[0x7E00_0000 | (op << 9), S_ENDPGM], Encoding::Vop1);
+            // VOP3-encoded VOP1
+            check(
+                &[0xD580_0000 | ((op + 0x180) << 16), 0x0000_0100, S_ENDPGM],
+                Encoding::Vop3,
+            );
+        }
+    }
+
+    #[test]
+    fn pruned_ssa_matches_maximal_ssa_oracle() {
+        // Canonicalize an SSA Program into structural def-use origins so two
+        // equivalent programs with different Value IDs compare equal.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Origin {
+            Input(Reg),
+            Phi(usize, Reg),
+            Write(usize, usize, Reg),
+        }
+        let canonical = |p: &Program| {
+            let mut map: std::collections::HashMap<Value, Origin> =
+                std::collections::HashMap::new();
+            for &(r, v) in &p.inputs {
+                map.insert(v, Origin::Input(r));
+            }
+            for (b, blk) in p.blocks.iter().enumerate() {
+                for phi in &blk.phis {
+                    map.insert(phi.value, Origin::Phi(b, phi.reg));
+                }
+                for (i, inst) in blk.insts.iter().enumerate() {
+                    for &(r, v) in &inst.writes {
+                        map.insert(v, Origin::Write(b, i, r));
+                    }
+                }
+            }
+            let phis: Vec<_> = p
+                .blocks
+                .iter()
+                .map(|blk| {
+                    blk.phis
+                        .iter()
+                        .map(|phi| {
+                            (
+                                phi.reg,
+                                phi.args
+                                    .iter()
+                                    .map(|a| &map[a])
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .map(|o| format!("{o:?}"))
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let reads: Vec<_> = p
+                .blocks
+                .iter()
+                .map(|blk| {
+                    blk.insts
+                        .iter()
+                        .map(|inst| {
+                            inst.reads
+                                .iter()
+                                .map(|(r, v)| (*r, format!("{:?}", map[v])))
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let inputs: Vec<Reg> = p.inputs.iter().map(|&(r, _)| r).collect();
+            (inputs, phis, reads)
+        };
+
+        // Reference maximal SSA + remove_trivial_phis on the same post-split blocks.
+        let maximal_oracle = |base: &Program| -> Program {
+            let mut blocks: Vec<Block> = base
+                .blocks
+                .iter()
+                .map(|b| Block {
+                    offset: b.offset,
+                    preds: b.preds.clone(),
+                    phis: Vec::new(),
+                    insts: b
+                        .insts
+                        .iter()
+                        .map(|i| Inst {
+                            machine: i.machine.clone(),
+                            fields: i.fields.clone(),
+                            reads: i.reads.iter().map(|&(r, _)| (r, NONE)).collect(),
+                            writes: i.writes.iter().map(|&(r, _)| (r, NONE)).collect(),
+                        })
+                        .collect(),
+                    exit: b.exit,
+                })
+                .collect();
+            let order = reverse_postorder(&blocks);
+            let (live_in, _) = liveness(&blocks, &order);
+            let empty = [0; REGS.div_ceil(64)];
+            let mut live_out = vec![empty; blocks.len()];
+            for &b in &order {
+                for s in blocks[b].exit.successors() {
+                    for (o, i) in live_out[b].iter_mut().zip(&live_in[s]) {
+                        *o |= i;
+                    }
+                }
+            }
+            let lookup = |outs: &[(Reg, Value)], reg: Reg| {
+                outs.binary_search_by_key(&reg, |&(r, _)| r)
+                    .map_or(NONE, |i| outs[i].1)
+            };
+            let mut values = 0u32;
+            let mut new_v = || {
+                values += 1;
+                Value(values - 1)
+            };
+            let mut inputs = Vec::new();
+            let mut outs: Vec<Vec<(Reg, Value)>> = vec![Vec::new(); blocks.len()];
+            let mut cur = [NONE; REGS];
+            for &b in &order {
+                cur.fill(NONE);
+                let blk = &mut blocks[b];
+                for reg in members(&live_in[b]) {
+                    cur[index(reg)] = match blk.preds[..] {
+                        [] => {
+                            let v = new_v();
+                            inputs.push((reg, v));
+                            v
+                        }
+                        [p] => lookup(&outs[p], reg),
+                        _ => {
+                            let value = new_v();
+                            blk.phis.push(Phi {
+                                reg,
+                                value,
+                                args: Vec::new(),
+                            });
+                            value
+                        }
+                    };
+                }
+                for inst in &mut blk.insts {
+                    for (reg, v) in &mut inst.reads {
+                        *v = cur[index(*reg)];
+                    }
+                    for (reg, v) in &mut inst.writes {
+                        *v = new_v();
+                        cur[index(*reg)] = *v;
+                    }
+                }
+                outs[b] = members(&live_out[b])
+                    .map(|reg| (reg, cur[index(reg)]))
+                    .collect();
+            }
+            for blk in &mut blocks {
+                for phi in &mut blk.phis {
+                    phi.args = blk.preds.iter().map(|&p| lookup(&outs[p], phi.reg)).collect();
+                }
+            }
+            remove_trivial_phis(&mut blocks, values);
+            Program {
+                wave64: base.wave64,
+                vgprs: base.vgprs,
+                blocks,
+                inputs,
+            }
+        };
+
+        // Case 1: Diamond with one-sided def of v2 (live-in from entry), dropped s_nop at
+        // fallthrough boundary, followed by a self-loop updating s1 and v1.
+        let case1: Vec<u32> = vec![
+            0xBE81_0381, // s_mov_b32 s1, 1
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 +2 -> skip v2 def
+            0x7E04_0285, // v_mov_b32 v2, 5
+            0xBF80_0000, // s_nop 0 (dropped right before join leader!)
+            // loop header:
+            0x8001_8101, // s_add_u32 s1, s1, 1
+            0x0602_0501, // v_add_f32 v1, v1, v2
+            0xBF0A_8A01, // s_cmp_lt_u32 s1, 10
+            0xBF85_FFFC, // s_cbranch_scc1 -4 -> self-loop!
+            0x7E00_0201, // v_mov_b32 v0, v1
+            S_ENDPGM,
+        ];
+        // Case 2: Nested diamonds + loop + s_waitcnt everywhere.
+        let mut case2 = vec![0xBE81_0380, 0xBE82_0381, 0x7E00_0280, 0x7E02_0281];
+        for _ in 0..6 {
+            case2.extend_from_slice(&[
+                0xBF06_8000, // s_cmp_eq_u32 s0, 0
+                0xBF85_0003, // s_cbranch_scc1 +3
+                0x0600_0300, // v_add_f32 v0, v0, v1
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xBF82_0001, // s_branch +1
+                0x1000_0300, // v_mul_f32 v0, v0, v1
+                0x8001_0201, // s_add_u32 s1, s1, s2
+            ]);
+        }
+        case2.push(S_ENDPGM);
+
+        for (idx, words) in [&case1, &case2].into_iter().enumerate() {
+            let p = build_words(words, false);
+            let ref_p = maximal_oracle(&p);
+            assert_eq!(canonical(&p), canonical(&ref_p), "case {idx} diverged");
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_ir_build_cfg_and_ssa() {
+        // Realistic large multi-block GFX10 shader: 32 live VGPRs + 16 live SGPRs across
+        // 32 diamonds + 4 loops + frequent s_waitcnt/s_nop scheduling ops.
+        let mut words = Vec::with_capacity(1024);
+        for v in 0..32u32 {
+            words.push(0x7E00_0280 | (v << 17)); // v_mov_b32 v{v}, 0
+        }
+        for s in 1..17u32 {
+            words.push(0xBE80_0380 | (s << 16)); // s_mov_b32 s{s}, 0
+        }
+        for d in 0..32u32 {
+            let v = d & 31;
+            let v2 = (d + 1) & 31;
+            let s = 1 + (d & 15);
+            words.extend_from_slice(&[
+                0xBF06_8000 | s,                                    // s_cmp_eq_u32 s{s}, 0
+                0xBF85_0004,                                        // s_cbranch_scc1 +4
+                0x0600_0100 | (v << 17) | (v2 << 9) | v,            // v_add_f32 v{v}, v{v}, v{v2}
+                0xBF8C_C07F,                                        // s_waitcnt lgkmcnt(0)
+                0xBF80_0000,                                        // s_nop 0
+                0xBF82_0002,                                        // s_branch +2
+                0x1000_0100 | (v << 17) | (v2 << 9) | v,            // v_mul_f32 v{v}, v{v}, v{v2}
+                0xBF8C_0F70,                                        // s_waitcnt vmcnt(0)
+                0x8000_8100 | (s << 16) | s,                        // s_add_u32 s{s}, s{s}, 1
+            ]);
+        }
+        for _ in 0..4 {
+            words.extend_from_slice(&[
+                0x8001_8101, // s_add_u32 s1, s1, 1
+                0x0600_0300, // v_add_f32 v0, v0, v1
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xBF0A_8A01, // s_cmp_lt_u32 s1, 10
+                0xBF85_FFFB, // s_cbranch_scc1 -5
+            ]);
+        }
+        // Keep all 32 VGPRs and 16 SGPRs live through the end so every join has 48+ live regs!
+        for v in 1..32u32 {
+            words.push(0x0600_0100 | (v << 9)); // v_add_f32 v0, v0, v{v}
+        }
+        for s in 1..17u32 {
+            words.push(0x8000_0000 | (s << 8)); // s_add_u32 s0, s0, s{s}
+        }
+        words.push(S_ENDPGM);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+        // Warmup + verify end-to-end structure + lowering determinism.
+        let p = build(&code, false, 32).unwrap();
+        let phis: usize = p.blocks.iter().map(|b| b.phis.len()).sum();
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..100 {
+            let q = build(&code, false, 32).unwrap();
+            std::hint::black_box(q.blocks.len());
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6 / 100.0;
+        eprintln!(
+            "ir::build ({} blocks, {phis} phis): {us:.1} us/run",
+            p.blocks.len()
+        );
     }
 }
