@@ -9442,11 +9442,8 @@ impl<'a> Lower<'a> {
             let o = vaddr(self, u8::from(*idxen))?;
             off = self.s.m.bin(c, Bin::Add, off, o);
         }
-        if !matches!(
-            soffset,
-            Operand::Scalar { code: NULL, .. } | Operand::Const(128)
-        ) {
-            let so = self.operand(inst, soffset)?;
+        let so = self.operand(inst, soffset)?;
+        if so != self.s.m.i32(0) {
             off = self.s.m.bin(c, Bin::Add, off, so);
         }
         let src = self

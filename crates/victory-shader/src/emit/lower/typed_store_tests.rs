@@ -11,7 +11,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 fn lower_typed_store(soffset: u8) -> Result<super::Lowered, ShaderError> {
     // s0: root constant (also used as non-zero soffset when soffset == 0)
     // s2: table holding a typed buffer UAV at entry 0
-    let words: [u32; 16] = [
+    let words = [
         0xBE8C_0302, // s_mov_b32 s12, s2
         0xBE8D_0380, // s_mov_b32 s13, 0
         0xF408_0406,
@@ -21,17 +21,13 @@ fn lower_typed_store(soffset: u8) -> Result<super::Lowered, ShaderError> {
         0x7E06_0280, // v_mov_b32 v3, 0
         0x7E08_0280, // v_mov_b32 v4, 0
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE8E_0390, // s_mov_b32 s14, 16
         // buffer_store_format_xyzw v[1:4], v0, s[16:19], soffset idxen
         // opcode 0x007 << 18 = 0x001C_0000, idxen = 1 << 13 = 0x2000
         0xE01C_2000,
         (u32::from(soffset) << 24) | (4 << 16) | (1 << 8),
         0xBF81_0000, // s_endpgm
-        0,
-        0,
-        0,
-        0,
     ];
-    let code_words = &words[..12];
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -68,7 +64,7 @@ fn lower_typed_store(soffset: u8) -> Result<super::Lowered, ShaderError> {
             rsrc2: 3 << 1,
             threads: [32, 1, 1],
         }),
-        code: code_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs)?;
     let st = structure::structure(&p)?;
@@ -86,6 +82,18 @@ fn lower_typed_store(soffset: u8) -> Result<super::Lowered, ShaderError> {
         mesh_stride: 0,
         view_marks: false,
     })
+}
+
+#[test]
+fn typed_buffer_store_accepts_zero_in_a_scalar_register() {
+    // The fixture loads s13 with zero before the store.
+    let via_register = lower_typed_store(0x0d).expect("s13 holds zero");
+    let inline = lower_typed_store(0x80).expect("inline zero");
+    assert_eq!(via_register.dxil, inline.dxil);
+    assert!(
+        lower_typed_store(0x0e).is_err(),
+        "s14 holds a nonzero offset"
+    );
 }
 
 #[test]
