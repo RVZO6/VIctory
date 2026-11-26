@@ -98,12 +98,11 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         // the loader maps the copy away from its preferred base (Wine always
         // does for DYNAMIC_BASE images), and the loader then reads callbacks
         // from there. Make that entry a no-op.
-        let field_rva = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
-        for (entry, target) in dir64_relocations(&bytes, &info) {
-            if target == field_rva {
-                write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
-            }
-        }
+        let field_rva = tls
+            .directory_rva
+            .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS as u32)
+            .ok_or(PrepareError::Patch("TLS callback field RVA overflows"))?;
+        clear_dir64_relocations(&mut bytes, &info, field_rva)?;
     }
 
     Ok(PreparedImage {
@@ -116,44 +115,58 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
 /// Size of an IMAGE_IMPORT_DESCRIPTOR in the PE file.
 const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
 
-/// Every `IMAGE_REL_BASED_DIR64` base relocation: (file offset of its entry,
-/// RVA it patches). Empty if the image has no readable relocation table.
-fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
+/// Clears every `IMAGE_REL_BASED_DIR64` base relocation targeting `target_rva`
+/// (turning it into `IMAGE_REL_BASED_ABSOLUTE`).
+///
+/// Each PE base-relocation block covers only `[page, page + 0xFFF]`, so blocks
+/// outside `target_rva`'s page are skipped without decoding their entries or
+/// allocating a `Vec` of every relocation in the image.
+fn clear_dir64_relocations(
+    bytes: &mut [u8],
+    info: &ImageInfo,
+    target_rva: u32,
+) -> Result<(), PrepareError> {
     const DIR64: u16 = 10;
-    let mut out = Vec::new();
     let Some(d) = layout::data_directory_offset(bytes, dir::BASERELOC) else {
-        return out;
+        return Ok(());
     };
     let (Some(rva), Some(size)) = (layout::read_u32(bytes, d), layout::read_u32(bytes, d + 4))
     else {
-        return out;
+        return Ok(());
     };
     let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
-        return out;
+        return Ok(());
     };
-    let (mut at, end) = (start as usize, start as usize + size as usize);
-    while at + 8 <= end {
+    let start = start as usize;
+    let end = start.saturating_add(size as usize).min(bytes.len());
+    let mut at = start;
+    while at.saturating_add(8) <= end {
         let (Some(page), Some(block)) =
             (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
         else {
             break;
         };
         let block = block as usize;
-        if block < 8 || at + block > end {
+        let Some(next) = at.checked_add(block) else {
+            break;
+        };
+        if block < 8 || next > end {
             break;
         }
-        for entry in (at + 8..at + block).step_by(2) {
-            let Some(e) = bytes.get(entry..entry + 2) else {
-                break;
-            };
-            let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64 {
-                out.push((entry, page + u32::from(e & 0xFFF)));
+        if let Some(wanted_off) = target_rva.checked_sub(page).filter(|&d| d < 0x1000) {
+            let wanted_entry = (DIR64 << 12) | (wanted_off as u16);
+            let mut entry = at + 8;
+            while entry + 2 <= next {
+                let e = u16::from_le_bytes([bytes[entry], bytes[entry + 1]]);
+                if e == wanted_entry {
+                    write_u16(bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
+                }
+                entry += 2;
             }
         }
-        at += block;
+        at = next;
     }
-    out
+    Ok(())
 }
 
 fn write_u16(bytes: &mut [u8], at: usize, v: u16) -> Result<(), PrepareError> {
@@ -279,5 +292,198 @@ mod tests {
         let a = prepare(&original).unwrap();
         let b = prepare(&original).unwrap();
         assert_eq!(a.file_name(), b.file_name());
+    }
+
+    /// Reference full-table scan kept in tests to verify `clear_dir64_relocations`
+    /// clears every matching entry and leaves every other entry untouched.
+    fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
+        const DIR64: u16 = 10;
+        let mut out = Vec::new();
+        let Some(d) = layout::data_directory_offset(bytes, dir::BASERELOC) else {
+            return out;
+        };
+        let (Some(rva), Some(size)) = (layout::read_u32(bytes, d), layout::read_u32(bytes, d + 4))
+        else {
+            return out;
+        };
+        let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
+            return out;
+        };
+        let (mut at, end) = (
+            start as usize,
+            (start as usize).saturating_add(size as usize).min(bytes.len()),
+        );
+        while at.saturating_add(8) <= end {
+            let (Some(page), Some(block)) =
+                (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
+            else {
+                break;
+            };
+            let block = block as usize;
+            let Some(next) = at.checked_add(block) else {
+                break;
+            };
+            if block < 8 || next > end {
+                break;
+            }
+            let mut entry = at + 8;
+            while entry + 2 <= next {
+                let e = u16::from_le_bytes([bytes[entry], bytes[entry + 1]]);
+                if e >> 12 == DIR64
+                    && let Some(target) = page.checked_add(u32::from(e & 0xFFF))
+                {
+                    out.push((entry, target));
+                }
+                entry += 2;
+            }
+            at = next;
+        }
+        out
+    }
+
+    /// Builds a minimal synthetic PE64 image whose `.reloc` section holds
+    /// `blocks` base-relocation blocks of `entries_per_block` `DIR64` entries
+    /// (plus one non-`DIR64` entry per block), starting at page `0x10000`.
+    fn synthetic_reloc_pe(blocks: usize, entries_per_block: usize) -> (Vec<u8>, ImageInfo) {
+        let block_bytes = 8 + (entries_per_block * 2).next_multiple_of(4);
+        let reloc_size = blocks * block_bytes;
+        let reloc_raw_size = reloc_size.next_multiple_of(0x200);
+        let headers_size = 0x200usize;
+        let mut pe = vec![0u8; headers_size + reloc_raw_size];
+
+        // DOS header
+        pe[0..2].copy_from_slice(b"MZ");
+        pe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+
+        // PE signature + COFF header at 0x80 (24 bytes)
+        let pe_off = 0x80usize;
+        pe[pe_off..pe_off + 4].copy_from_slice(b"PE\0\0");
+        let coff = pe_off + 4;
+        pe[coff..coff + 2].copy_from_slice(&0x8664u16.to_le_bytes()); // AMD64
+        pe[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections = 1
+        let opt_size: u16 = 0xF0;
+        pe[coff + 16..coff + 18].copy_from_slice(&opt_size.to_le_bytes());
+        pe[coff + 18..coff + 20].copy_from_slice(&0x0022u16.to_le_bytes()); // EXECUTABLE | LARGE_ADDRESS_AWARE
+
+        // Optional header PE32+ at 0x98 (240 bytes)
+        let opt = coff + 20;
+        pe[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes()); // PE32+
+        pe[opt + 24..opt + 32].copy_from_slice(&0x1_4000_0000u64.to_le_bytes()); // ImageBase
+        pe[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes()); // SectionAlignment
+        pe[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes()); // FileAlignment
+        let reloc_rva: u32 = 0x1000;
+        let reloc_vsize = reloc_raw_size as u32;
+        let size_of_image = reloc_rva + reloc_vsize.next_multiple_of(0x1000);
+        pe[opt + 56..opt + 60].copy_from_slice(&size_of_image.to_le_bytes());
+        pe[opt + 60..opt + 64].copy_from_slice(&(headers_size as u32).to_le_bytes());
+        pe[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
+
+        // Data directory entry 5 (BASERELOC) at opt + 112 + 5 * 8
+        let dd = opt + 112 + dir::BASERELOC * 8;
+        pe[dd..dd + 4].copy_from_slice(&reloc_rva.to_le_bytes());
+        pe[dd + 4..dd + 8].copy_from_slice(&(reloc_size as u32).to_le_bytes());
+
+        // Single section header `.reloc` at opt + 0xF0 (40 bytes)
+        let sec = opt + opt_size as usize;
+        pe[sec..sec + 6].copy_from_slice(b".reloc");
+        pe[sec + 8..sec + 12].copy_from_slice(&reloc_vsize.to_le_bytes()); // VirtualSize
+        pe[sec + 12..sec + 16].copy_from_slice(&reloc_rva.to_le_bytes()); // VirtualAddress
+        pe[sec + 16..sec + 20].copy_from_slice(&(reloc_raw_size as u32).to_le_bytes()); // SizeOfRawData
+        pe[sec + 20..sec + 24].copy_from_slice(&(headers_size as u32).to_le_bytes()); // PointerToRawData
+        pe[sec + 36..sec + 40].copy_from_slice(&0x4200_0040u32.to_le_bytes());
+
+        // Populate base relocation blocks
+        let mut cursor = headers_size;
+        for b in 0..blocks {
+            let page = 0x10000u32 + (b as u32) * 0x1000;
+            pe[cursor..cursor + 4].copy_from_slice(&page.to_le_bytes());
+            pe[cursor + 4..cursor + 8].copy_from_slice(&(block_bytes as u32).to_le_bytes());
+            for i in 0..entries_per_block {
+                let off = ((i * 8) & 0xFFF) as u16;
+                // Make entry 0 a non-DIR64 type (HIGHLOW = 3) so we verify type filtering too.
+                let ty: u16 = if i == 0 { 3 } else { 10 };
+                let word = (ty << 12) | off;
+                let p = cursor + 8 + i * 2;
+                pe[p..p + 2].copy_from_slice(&word.to_le_bytes());
+            }
+            cursor += block_bytes;
+        }
+
+        let info = ImageInfo::parse(&pe).unwrap();
+        (pe, info)
+    }
+
+    #[test]
+    fn clear_dir64_relocations_matches_full_scan_and_preserves_neighbors() {
+        let (orig, info) = synthetic_reloc_pe(64, 16);
+        let targets = [
+            0x10000 + 8,          // first block, DIR64
+            0x10000,              // first block, non-DIR64 (type 3) -> must stay untouched
+            0x10000 + 31 * 0x1000 + 48, // middle block, DIR64
+            0x10000 + 63 * 0x1000 + 120, // last block, DIR64
+            0x90000 + 16,         // absent page
+        ];
+        for &target in &targets {
+            let mut fast = orig.clone();
+            clear_dir64_relocations(&mut fast, &info, target).unwrap();
+
+            let mut reference = orig.clone();
+            for (entry, rva) in dir64_relocations(&orig, &info) {
+                if rva == target {
+                    write_u16(&mut reference, entry, 0).unwrap();
+                }
+            }
+            assert_eq!(fast, reference, "mismatch for target {target:#x}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_clear_dir64_relocations() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // 3,000 blocks x 250 entries = 750,000 relocations (retail-sized .reloc table).
+        let (orig, info) = synthetic_reloc_pe(3_000, 250);
+        let target = 0x10000 + 2_500 * 0x1000 + 80;
+        let iters = 50usize;
+
+        let mut buf_old = orig.clone();
+        let t0 = Instant::now();
+        let mut hits_old = 0usize;
+        for _ in 0..iters {
+            // Restore entry before each iteration so both paths do identical work.
+            let matches = dir64_relocations(black_box(&buf_old), &info);
+            for (entry, rva) in matches {
+                if rva == target {
+                    write_u16(&mut buf_old, entry, 0).unwrap();
+                    hits_old += 1;
+                }
+            }
+            let pos = 0x200 + 2_500 * (8 + (250 * 2usize).next_multiple_of(4)) + 8 + 10 * 2;
+            write_u16(&mut buf_old, pos, (10u16 << 12) | 80).unwrap();
+        }
+        let old_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let mut buf_new = orig.clone();
+        let t1 = Instant::now();
+        let mut hits_new = 0usize;
+        for _ in 0..iters {
+            clear_dir64_relocations(black_box(&mut buf_new), &info, target).unwrap();
+            let pos = 0x200 + 2_500 * (8 + (250 * 2usize).next_multiple_of(4)) + 8 + 10 * 2;
+            if u16::from_le_bytes([buf_new[pos], buf_new[pos + 1]]) == 0 {
+                hits_new += 1;
+            }
+            write_u16(&mut buf_new, pos, (10u16 << 12) | 80).unwrap();
+        }
+        let new_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+        assert_eq!(hits_old, iters);
+        assert_eq!(hits_new, iters);
+        assert_eq!(buf_old, buf_new);
+        eprintln!(
+            "prepare_reloc[3000 blocks x 250 entries x{iters}]: old={old_ms:.2}ms new={new_ms:.4}ms speedup={:.1}x",
+            old_ms / new_ms
+        );
     }
 }
