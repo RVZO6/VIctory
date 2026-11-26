@@ -743,11 +743,12 @@ extern "system" fn heap_query(this: This, iid: *const Iid, out: *mut This) -> HR
 extern "system" fn heap_release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
-extern "system" fn heap_desc(this: This, out: *mut HeapDesc) {
+extern "system" fn heap_desc(this: This, out: *mut HeapDesc) -> *mut HeapDesc {
     if !out.is_null() {
         // SAFETY: `this` is a heap; the title passes room for a description.
         unsafe { out.write((*this.cast::<Heap>()).desc) };
     }
+    out
 }
 
 /// A resource's memory: its own, or a range of a heap it holds a reference
@@ -2149,11 +2150,12 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
     S_OK
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
-extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
+extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) -> *mut ResourceDesc {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(resource(this).desc) };
     }
+    out
 }
 /// Device method `GetCustomHeapProperties`, returning its struct through a
 /// hidden first argument: what a standard heap type is as a custom heap.
@@ -2535,10 +2537,38 @@ mod tests {
         let memory = unsafe { &(*heap.cast::<Heap>()).memory };
         assert_eq!(memory.ptr.as_ptr() as u64 % KIB_64, 0);
         let mut back = std::mem::MaybeUninit::<HeapDesc>::uninit();
-        slot::<extern "system" fn(This, *mut HeapDesc)>(heap, 0x40)(heap, back.as_mut_ptr());
+        let ret = slot::<extern "system" fn(This, *mut HeapDesc) -> *mut HeapDesc>(heap, 0x40)(
+            heap,
+            back.as_mut_ptr(),
+        );
+        assert_eq!(ret, back.as_mut_ptr());
         // SAFETY: written above.
         assert_eq!(unsafe { back.assume_init() }.size, 1 << 20);
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
+
+        let desc = buffer(256);
+        let mut res = std::ptr::null();
+        assert_eq!(
+            create_committed(
+                std::ptr::null(),
+                &PROPERTIES,
+                0,
+                &desc,
+                0,
+                std::ptr::null(),
+                &RESOURCE_IIDS[0],
+                &mut res,
+            ),
+            S_OK
+        );
+        let mut rback = std::mem::MaybeUninit::<ResourceDesc>::uninit();
+        let rret = slot::<extern "system" fn(This, *mut ResourceDesc) -> *mut ResourceDesc>(
+            res, 0x50,
+        )(res, rback.as_mut_ptr());
+        assert_eq!(rret, rback.as_mut_ptr());
+        // SAFETY: written above.
+        assert_eq!(unsafe { rback.assume_init() }.width, 256);
+        assert_eq!(slot::<Release>(res, 0x10)(res), 0);
 
         let bad = HeapDesc {
             size: 1 << 20,

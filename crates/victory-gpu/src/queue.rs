@@ -699,11 +699,12 @@ extern "system" fn copy_page_mappings(
     S_OK
 }
 
-extern "system" fn desc(this: This, out: *mut QueueDesc) {
+extern "system" fn desc(this: This, out: *mut QueueDesc) -> *mut QueueDesc {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(queue(this).desc) };
     }
+    out
 }
 
 /// The queue methods by their slot in older titles' queues (the 2020-era
@@ -856,6 +857,15 @@ mod tests {
         };
         let mut q = null;
         assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let desc_slot = if signal_slot(q) == 0x80 { 0xe0 } else { 0xd0 };
+        let mut back = std::mem::MaybeUninit::<QueueDesc>::uninit();
+        let ret = slot::<extern "system" fn(This, *mut QueueDesc) -> *mut QueueDesc>(q, desc_slot)(
+            q,
+            back.as_mut_ptr(),
+        );
+        assert_eq!(ret, back.as_mut_ptr());
+        // SAFETY: written above.
+        assert_eq!(unsafe { back.assume_init() }.kind, 0);
         // SAFETY: the title reads the type at +0x10.
         assert_eq!(unsafe { q.cast::<u8>().add(0x10).cast::<u32>().read() }, 0);
         let mut fence = null;
