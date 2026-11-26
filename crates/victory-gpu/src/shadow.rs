@@ -411,11 +411,13 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
+        if let Some((taken, before)) = segments
+            .iter_mut()
+            .find(|(at, bytes)| *at <= from && to <= at + bytes.len())
             && back
             && from < to
         {
-            let before = &before[from - taken..to - taken];
+            let before = &mut before[from - *taken..to - *taken];
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
             // By 64 KiB piece: the copy compared with its bytes before the
@@ -429,7 +431,7 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
+                let old = &mut before[at - from..at - from + n];
                 let title = &mut title[..n];
                 // A whole piece is compared once per submission, whichever
                 // declared ranges overlap it: then what the GPU wrote there
@@ -448,6 +450,10 @@ impl Shadow {
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
                     }
+                    // Advance the saved snapshot to the merged copy so a later
+                    // overlapping copy-back in the same submission does not
+                    // mistake earlier CPU writes (now in `host`) for GPU writes.
+                    old.copy_from_slice(host);
                     synced.push((start + at) / PAGE);
                 }
                 at += n;
@@ -1656,5 +1662,57 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    /// Overlapping copy-backs within a single submission must advance the
+    /// saved `before` snapshot after `merge_writeback` so a second overlapping
+    /// copy-back does not mistake earlier CPU writes (copied into `host`) for
+    /// GPU writes and clobber newer CPU writes.
+    #[test]
+    fn overlapping_copy_backs_do_not_clobber_newer_cpu_writes() {
+        let cases = [
+            ("partial_then_wider", (0, 0x1000), (0, 0x2000), 0),
+            ("partial_then_whole_page", (0x1000, 0x1000), (0, PAGE), 0x1000),
+        ];
+        for (label, (off1, len1), (off2, len2), probe) in cases {
+            let p = crate::watch::tests::pool(2);
+            let len = 2 * PAGE;
+            let write_title = |at: usize, v: u8| {
+                // SAFETY: bytes inside our allocated test pool.
+                unsafe { ((p + at) as *mut u8).write_volatile(v) };
+            };
+            let read_title = |at: usize| {
+                // SAFETY: bytes inside our allocated test pool.
+                unsafe { ((p + at) as *const u8).read_volatile() }
+            };
+            write_title(probe, 0x11);
+            write_title(probe + 1, 0x11);
+            register(p, p as u64, len as u64);
+            let Some(copy) = find(p as u64, len as u64) else {
+                unregister(p, p as u64);
+                return; // no host GPU here
+            };
+            copy.update(p, len);
+            copy.writing(p + off1, len1, false);
+            copy.writing(p + off2, len2, false);
+            // GPU writes byte `probe`; CPU concurrently writes byte `probe + 1`.
+            copy.write_host((p + probe) as u64, &[0xAA]);
+            write_title(probe + 1, 0x22);
+            copy.copy_back(p + off1, len1);
+            assert_eq!(read_title(probe), 0xAA, "{label}: first GPU writeback");
+            assert_eq!(read_title(probe + 1), 0x22, "{label}: first CPU write preserved");
+
+            // Title writes a newer byte to `probe + 1` before the overlapping
+            // second copy-back of the same submission runs.
+            write_title(probe + 1, 0x33);
+            copy.copy_back(p + off2, len2);
+            assert_eq!(read_title(probe), 0xAA, "{label}: GPU write stays");
+            assert_eq!(
+                read_title(probe + 1),
+                0x33,
+                "{label}: newer CPU write must not be clobbered by stale before snapshot"
+            );
+            unregister(p, p as u64);
+        }
     }
 }
