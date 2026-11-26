@@ -60,11 +60,13 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
         text.clone()
     } else if let Some(rest) = text.strip_prefix(r"\??\") {
         // The same prefix as the object manager spells it; the host's file
-        // calls take it too.
+        // calls take it too. Rewrite mounted virtual drives via `\\?\`,
+        // keeping the original `\??\` spelling when the drive is unmounted.
         if !drive(rest) {
             return Err(("unc".into(), host_of(rest.trim_start_matches("UNC\\"))));
         }
-        return Ok(with_nul(url));
+        let verbatim: Vec<u16> = format!(r"\\?\{rest}").encode_utf16().collect();
+        return Ok(files::translate(&verbatim).unwrap_or_else(|| with_nul(url)));
     } else if share(&text) {
         return Err(("unc".into(), host_of(&text[2..])));
     } else if drive(&text) {
@@ -631,6 +633,35 @@ mod tests {
         );
         assert_eq!(host_path("file:////C:/Windows/a.wav"), r"C:\Windows\a.wav");
         assert_eq!(host_path("file:///movies/a.mp4"), r"\movies\a.mp4");
+    }
+
+    #[test]
+    fn object_manager_prefix_translates_virtual_drives() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("movies")).unwrap();
+        std::fs::write(dir.path().join("movies").join("clip.mp4"), b"nt").unwrap();
+        let letter = files::mount(dir.path()).expect("a free drive letter");
+        let verbatim = text(&local(&wide(&format!(r"\\?\{letter}:\movies\clip.mp4"))).unwrap());
+        let nt_path = text(&local(&wide(&format!(r"\??\{letter}:\movies\clip.mp4"))).unwrap());
+        assert_eq!(
+            nt_path, verbatim,
+            r"\??\<drive>:\ must translate virtual drives like \\?\<drive>:\"
+        );
+        assert_eq!(
+            std::fs::read(&nt_path).ok().as_deref(),
+            Some(&b"nt"[..]),
+            "{nt_path}"
+        );
+        // An unmounted drive keeps its original `\??\` spelling.
+        assert_eq!(
+            text(&local(&wide(r"\??\C:\Windows\a.wav")).unwrap()),
+            r"\??\C:\Windows\a.wav"
+        );
+        // Non-drive `\??\` paths remain rejected as shares.
+        assert_eq!(
+            local(&wide(r"\??\UNC\server\share\a.mp4")),
+            Err(("unc".into(), "server".into()))
+        );
     }
 
     #[test]
